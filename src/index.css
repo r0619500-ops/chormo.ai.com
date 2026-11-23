@@ -1,0 +1,154 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-display: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-sans: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    color-scheme: dark;
+  }
+
+  html,
+  body {
+    font-family: var(--font-sans);
+    height: 100%;
+    background-color: #03060f;
+    color: #e2e8f0;
+  }
+
+  h1,
+  h2,
+  h3,
+  .font-display {
+    font-family: var(--font-display);
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: var(--font-mono);
+  }
+}
+
+/* Custom sleek dark scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(56, 189, 248, 0.16);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(56, 189, 248, 0.34);
+}
+
+@keyframes chormo-spin-slow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes chormo-spin-reverse {
+  from {
+    transform: rotate(360deg);
+  }
+  to {
+    transform: rotate(0deg);
+  }
+}
+
+@keyframes chormo-scan-sweep {
+  0% {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+  20% {
+    opacity: 0.45;
+  }
+  80% {
+    opacity: 0.45;
+  }
+  100% {
+    transform: translateY(220%);
+    opacity: 0;
+  }
+}
+
+@keyframes chormo-pulse {
+  0%, 80%, 100% {
+    transform: scale(0.7);
+    opacity: 0.35;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes chormo-float {
+  0%, 100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-6px);
+  }
+}
+
+.chormo-dot-1 {
+  animation: chormo-pulse 1.2s infinite ease-in-out;
+}
+.chormo-dot-2 {
+  animation: chormo-pulse 1.2s infinite ease-in-out 0.16s;
+}
+.chormo-dot-3 {
+  animation: chormo-pulse 1.2s infinite ease-in-out 0.32s;
+}
+
+.chormo-ring-cw {
+  animation: chormo-spin-slow 24s linear infinite;
+}
+
+.chormo-ring-ccw {
+  animation: chormo-spin-reverse 18s linear infinite;
+}
+
+.chormo-ring-fast-cw {
+  animation: chormo-spin-slow 7s linear infinite;
+}
+
+.chormo-ring-fast-ccw {
+  animation: chormo-spin-reverse 5.5s linear infinite;
+}
+
+.chormo-scan {
+  animation: chormo-scan-sweep 5.5s ease-in-out infinite;
+}
+
+.chormo-float {
+  animation: chormo-float 5.5s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chormo-dot-1,
+  .chormo-dot-2,
+  .chormo-dot-3,
+  .chormo-ring-cw,
+  .chormo-ring-ccw,
+  .chormo-ring-fast-cw,
+  .chormo-ring-fast-ccw,
+  .chormo-scan,
+  .chormo-float {
+    animation: none;
+  }
+}
