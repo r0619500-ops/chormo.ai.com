@@ -32,6 +32,7 @@ import type {
   ModelOption,
   UserProfile,
 } from './types/chat';
+import type { StudioImageItem } from './types/imageStudio';
 
 const STORAGE_KEYS = {
   CHATS: 'chromo_ai_chats_v1',
@@ -175,6 +176,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
   const [imageCreatorOpen, setImageCreatorOpen] = useState(false);
+  const [studioImages, setStudioImages] = useState<StudioImageItem[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
@@ -269,6 +271,9 @@ export default function App() {
     audioLevelRef.current = 0;
   }, []);
 
+  const studioImagesRef = useRef<StudioImageItem[]>(studioImages);
+  studioImagesRef.current = studioImages;
+
   useEffect(() => {
     return () => {
       abortControllerRef.current?.abort();
@@ -285,8 +290,44 @@ export default function App() {
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
         window.speechSynthesis.cancel();
       }
+      studioImagesRef.current.forEach((img) => {
+        URL.revokeObjectURL(img.url);
+      });
     };
   }, [stopMicLevelMonitor]);
+
+  const handleAddStudioImage = useCallback((item: StudioImageItem) => {
+    setStudioImages((prev) => [item, ...prev]);
+  }, []);
+
+  const handleReplaceStudioImage = useCallback((targetId: string, nextItem: StudioImageItem) => {
+    setStudioImages((prev) =>
+      prev.map((img) => {
+        if (img.id === targetId) {
+          URL.revokeObjectURL(img.url);
+          return nextItem;
+        }
+        return img;
+      })
+    );
+  }, []);
+
+  const handleRemoveStudioImage = useCallback((id: string) => {
+    setStudioImages((prev) => {
+      const target = prev.find((img) => img.id === id);
+      if (target) {
+        URL.revokeObjectURL(target.url);
+      }
+      return prev.filter((img) => img.id !== id);
+    });
+  }, []);
+
+  const handleClearStudioImages = useCallback(() => {
+    setStudioImages((prev) => {
+      prev.forEach((img) => URL.revokeObjectURL(img.url));
+      return [];
+    });
+  }, []);
 
   const scrollToBottom = useCallback(() => {
     const el = viewportRef.current;
@@ -1306,6 +1347,11 @@ export default function App() {
 
       <ImageGenerator
         isOpen={imageCreatorOpen}
+        images={studioImages}
+        onAddImage={handleAddStudioImage}
+        onReplaceImage={handleReplaceStudioImage}
+        onRemoveImage={handleRemoveStudioImage}
+        onClearImages={handleClearStudioImages}
         onClose={() => setImageCreatorOpen(false)}
       />
 

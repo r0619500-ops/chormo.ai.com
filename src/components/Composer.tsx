@@ -125,8 +125,8 @@ export function Composer({
             <button
               type="button"
               onClick={onOpenImageCreator}
-              title="Open Image Creator"
-              aria-label="Open Image Creator"
+              title="Open Chormo AI Image Studio"
+              aria-label="Open Chormo AI Image Studio"
               className="w-10 h-10 rounded-xl flex items-center justify-center text-slate-400 hover:text-cyan-200 hover:bg-cyan-400/10 border border-transparent hover:border-cyan-400/20 transition-all cursor-pointer"
             >
               <ImagePlus className="w-[18px] h-[18px]" />

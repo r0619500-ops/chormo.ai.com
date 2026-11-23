@@ -256,7 +256,7 @@ export function Sidebar({
             className="w-full min-h-[40px] px-3 py-2 rounded-xl text-[13.5px] text-slate-300 hover:text-sky-50 hover:bg-cyan-400/10 border border-transparent hover:border-cyan-400/20 flex items-center gap-2.5 transition-colors cursor-pointer whitespace-nowrap"
           >
             <ImagePlus className="w-4 h-4 text-cyan-400 shrink-0" />
-            <span>Image Creator</span>
+            <span>Image Studio</span>
           </button>
 
           <button

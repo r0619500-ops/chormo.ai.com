@@ -1,6 +1,6 @@
 {
   "name": "CHROMO AI",
-  "description": "CHROMO AI — Minimal AI chat web application founded by Meet Shasane, powered by Google Gemini.",
+  "description": "CHORMO AI — Next-generation digital intelligence assistant founded by Meet Shasane.",
   "requestFramePermissions": ["microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
