@@ -11,11 +11,15 @@ import { ProfileModal } from './components/ProfileModal';
 import { SettingsModal } from './components/SettingsModal';
 import { Sidebar } from './components/Sidebar';
 import { VoiceMode } from './components/VoiceMode';
+import { streamChatCompletion } from './utils/chatStream';
 import {
   cleanTextForSpeech,
+  ensureVoicesLoaded,
+  getSharedAudioContext,
   getSupportedAudioMimeType,
   getTranscribeCooldownSeconds,
-  selectBestFemaleVoice,
+  resolveConsistentVoice,
+  synthesizeGeminiSpeech,
   transcribeAudioBlob,
   unlockAudioContext,
 } from './utils/voiceSpeech';
@@ -187,6 +191,11 @@ export default function App() {
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const dictationWatchdogRef = useRef<number | null>(null);
   const ttsWatchdogRef = useRef<number | null>(null);
+  const chatSpeechTokenRef = useRef<number>(0);
+  const ttsAbortRef = useRef<AbortController | null>(null);
+  const ttsSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const ttsHtmlAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsAudioUrlRef = useRef<string | null>(null);
   const dictationRecorderRef = useRef<MediaRecorder | null>(null);
   const dictationStreamRef = useRef<MediaStream | null>(null);
   const dictationAudioCtxRef = useRef<AudioContext | null>(null);
@@ -199,7 +208,9 @@ export default function App() {
   const settingsRef = useRef<AppSettings>(settings);
   settingsRef.current = settings;
 
-  const ttsSupported = typeof window !== 'undefined' && 'speechSynthesis' in window;
+  const ttsSupported =
+    typeof window !== 'undefined' &&
+    ('speechSynthesis' in window || settings.voiceEngine === 'cloud-kore');
   const voiceSupported = useMemo(() => {
     if (typeof window === 'undefined') return false;
     return (
@@ -228,6 +239,31 @@ export default function App() {
 
   useEffect(() => {
     document.documentElement.classList.add('dark');
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    let cancelled = false;
+    void ensureVoicesLoaded().then((loaded) => {
+      if (cancelled || loaded.length === 0) return;
+      if (!settingsRef.current.voiceURI) {
+        const chosen = resolveConsistentVoice(loaded, '', settingsRef.current.voiceLang);
+        if (chosen) {
+          setSettings((prev) =>
+            prev.voiceURI
+              ? prev
+              : {
+                  ...prev,
+                  voiceURI: chosen.voiceURI,
+                  voiceLang: chosen.lang || 'en-US',
+                }
+          );
+        }
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -277,6 +313,27 @@ export default function App() {
   useEffect(() => {
     return () => {
       abortControllerRef.current?.abort();
+      ttsAbortRef.current?.abort();
+      if (ttsWatchdogRef.current) {
+        window.clearTimeout(ttsWatchdogRef.current);
+      }
+      if (ttsSourceRef.current) {
+        try {
+          ttsSourceRef.current.stop();
+        } catch {
+          // Ignore
+        }
+      }
+      if (ttsHtmlAudioRef.current) {
+        try {
+          ttsHtmlAudioRef.current.pause();
+        } catch {
+          // Ignore
+        }
+      }
+      if (ttsAudioUrlRef.current) {
+        URL.revokeObjectURL(ttsAudioUrlRef.current);
+      }
       recognitionRef.current?.stop();
       if (dictationRecorderRef.current && dictationRecorderRef.current.state !== 'inactive') {
         try {
@@ -341,6 +398,34 @@ export default function App() {
   }, [activeConversation?.messages.length, isStreaming, scrollToBottom]);
 
   const stopSpeech = useCallback(() => {
+    chatSpeechTokenRef.current += 1;
+    if (ttsAbortRef.current) {
+      ttsAbortRef.current.abort();
+      ttsAbortRef.current = null;
+    }
+    if (ttsSourceRef.current) {
+      try {
+        ttsSourceRef.current.onended = null;
+        ttsSourceRef.current.stop();
+      } catch {
+        // Ignore
+      }
+      ttsSourceRef.current = null;
+    }
+    if (ttsHtmlAudioRef.current) {
+      try {
+        ttsHtmlAudioRef.current.onended = null;
+        ttsHtmlAudioRef.current.onerror = null;
+        ttsHtmlAudioRef.current.pause();
+      } catch {
+        // Ignore
+      }
+      ttsHtmlAudioRef.current = null;
+    }
+    if (ttsAudioUrlRef.current) {
+      URL.revokeObjectURL(ttsAudioUrlRef.current);
+      ttsAudioUrlRef.current = null;
+    }
     if (ttsWatchdogRef.current) {
       window.clearTimeout(ttsWatchdogRef.current);
       ttsWatchdogRef.current = null;
@@ -366,43 +451,166 @@ export default function App() {
   }, []);
 
   const speakMessageText = useCallback(
-    (msgId: string, content: string) => {
-      if (!ttsSupported) return;
-      if (ttsWatchdogRef.current) {
-        window.clearTimeout(ttsWatchdogRef.current);
-        ttsWatchdogRef.current = null;
-      }
-      window.speechSynthesis.cancel();
+    async (msgId: string, content: string) => {
       const clean = cleanTextForSpeech(content);
       if (!clean) return;
 
-      const utterance = new SpeechSynthesisUtterance(clean);
-      const femaleVoice = selectBestFemaleVoice(window.speechSynthesis.getVoices());
-      if (femaleVoice) {
-        utterance.voice = femaleVoice;
-      }
-      utterance.rate = settingsRef.current.speechRate || 1.0;
-      utterance.pitch = 1.04;
+      stopSpeech();
+      const token = ++chatSpeechTokenRef.current;
+      const activeSettings = settingsRef.current;
+      const speechRate = activeSettings.speechRate || 1.0;
+      const speechPitch = activeSettings.speechPitch || 1.0;
 
       const clearSpeaking = () => {
         if (ttsWatchdogRef.current) {
           window.clearTimeout(ttsWatchdogRef.current);
           ttsWatchdogRef.current = null;
         }
+        if (ttsAudioUrlRef.current) {
+          URL.revokeObjectURL(ttsAudioUrlRef.current);
+          ttsAudioUrlRef.current = null;
+        }
+        ttsSourceRef.current = null;
+        ttsHtmlAudioRef.current = null;
         setSpeakingMessageId((curr) => (curr === msgId ? null : curr));
       };
 
-      utterance.onend = clearSpeaking;
-      utterance.onerror = clearSpeaking;
+      setSpeakingMessageId(msgId);
 
-      // Safety timeout so browser speechSynthesis bugs cannot trap UI in Speaking state
-      const maxMs = Math.max(5000, clean.length * 90 + 3000);
+      // Mode 1: Studio Voice (pinned Kore) — no silent accent switching on error
+      if (activeSettings.voiceEngine === 'cloud-kore') {
+        const controller = new AbortController();
+        ttsAbortRef.current = controller;
+        const synthResult = await synthesizeGeminiSpeech(clean, controller.signal);
+        if (chatSpeechTokenRef.current !== token) return;
+
+        if (!synthResult.buffer) {
+          clearSpeaking();
+          showNotice(
+            synthResult.error ||
+              'Studio Voice (Kore) is unavailable right now. Switch to Locked System Voice in Settings.',
+            5000
+          );
+          return;
+        }
+
+        const ctx = getSharedAudioContext();
+        if (ctx) {
+          try {
+            if (ctx.state === 'suspended') {
+              await Promise.race([
+                ctx.resume().catch(() => {}),
+                new Promise((r) => window.setTimeout(r, 450)),
+              ]);
+            }
+            if (ctx.state === 'running') {
+              const decoded = await ctx.decodeAudioData(synthResult.buffer.slice(0));
+              if (chatSpeechTokenRef.current !== token) return;
+
+              const source = ctx.createBufferSource();
+              source.buffer = decoded;
+              source.playbackRate.value = speechRate;
+              source.connect(ctx.destination);
+              ttsSourceRef.current = source;
+
+              const durationMs = Math.max(
+                1500,
+                Math.ceil((decoded.duration * 1000) / Math.max(0.5, speechRate)) + 1200
+              );
+              ttsWatchdogRef.current = window.setTimeout(clearSpeaking, durationMs);
+              source.onended = clearSpeaking;
+              source.start(0);
+              return;
+            }
+          } catch {
+            // Fall through to HTMLAudioElement using the same Kore buffer
+          }
+        }
+
+        try {
+          const audioBlob = new Blob([synthResult.buffer], { type: synthResult.mimeType });
+          const url = URL.createObjectURL(audioBlob);
+          ttsAudioUrlRef.current = url;
+          const audio = new Audio(url);
+          audio.playbackRate = speechRate;
+          ttsHtmlAudioRef.current = audio;
+
+          const safetyMs = Math.max(
+            6000,
+            Math.ceil((clean.length * 85) / Math.max(0.5, speechRate)) + 2500
+          );
+          ttsWatchdogRef.current = window.setTimeout(clearSpeaking, safetyMs);
+          audio.onended = clearSpeaking;
+          audio.onerror = () => {
+            clearSpeaking();
+            showNotice('Unable to play Studio Voice audio.', 4500);
+          };
+          await audio.play();
+          return;
+        } catch {
+          clearSpeaking();
+          showNotice('Audio playback was blocked or unavailable.', 4500);
+          return;
+        }
+      }
+
+      // Mode 2: Locked System Voice — awaits voiceschanged and preserves exact voiceURI/accent
+      if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+        clearSpeaking();
+        showNotice('Text-to-speech is not supported in this browser.');
+        return;
+      }
+
+      const loadedVoices = await ensureVoicesLoaded();
+      if (chatSpeechTokenRef.current !== token) return;
+
+      const lockedVoice = resolveConsistentVoice(
+        loadedVoices,
+        activeSettings.voiceURI,
+        activeSettings.voiceLang
+      );
+
+      if (!activeSettings.voiceURI && lockedVoice) {
+        setSettings((prev) =>
+          prev.voiceURI
+            ? prev
+            : {
+                ...prev,
+                voiceURI: lockedVoice.voiceURI,
+                voiceLang: lockedVoice.lang || 'en-US',
+              }
+        );
+      }
+
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(clean);
+      if (lockedVoice) {
+        utterance.voice = lockedVoice;
+        utterance.lang = lockedVoice.lang || activeSettings.voiceLang || 'en-US';
+      } else {
+        utterance.lang = activeSettings.voiceLang || 'en-US';
+      }
+      utterance.rate = speechRate;
+      utterance.pitch = speechPitch;
+
+      utterance.onend = clearSpeaking;
+      utterance.onerror = (ev) => {
+        const reason = (ev as { error?: string })?.error;
+        clearSpeaking();
+        if (reason !== 'canceled' && reason !== 'interrupted') {
+          showNotice('Unable to play the locked voice output.', 4500);
+        }
+      };
+
+      const maxMs = Math.max(
+        5000,
+        Math.ceil((clean.length * 90) / Math.max(0.5, speechRate)) + 3000
+      );
       ttsWatchdogRef.current = window.setTimeout(clearSpeaking, maxMs);
 
-      setSpeakingMessageId(msgId);
       window.speechSynthesis.speak(utterance);
     },
-    [ttsSupported]
+    [showNotice, stopSpeech]
   );
 
   const handleToggleSpeak = useCallback(
@@ -412,12 +620,13 @@ export default function App() {
         return;
       }
 
+      unlockAudioContext();
       if (speakingMessageId === msg.id) {
         stopSpeech();
         return;
       }
 
-      speakMessageText(msg.id, msg.content);
+      void speakMessageText(msg.id, msg.content);
     },
     [ttsSupported, speakingMessageId, stopSpeech, speakMessageText, showNotice]
   );
@@ -658,90 +867,36 @@ export default function App() {
       abortControllerRef.current = controller;
 
       try {
-        const res = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+        const accumulated = await streamChatCompletion({
+          model,
+          messages: historyForServer,
           signal: controller.signal,
-          body: JSON.stringify({
-            model,
-            messages: historyForServer,
-          }),
+          onDelta: (currentText) => {
+            setConversations((prev) =>
+              prev.map((c) =>
+                c.id === chatId
+                  ? {
+                      ...c,
+                      updatedAt: Date.now(),
+                      messages: c.messages.map((m) =>
+                        m.id === assistantMsgId ? { ...m, content: currentText } : m
+                      ),
+                    }
+                  : c
+              )
+            );
+            scrollToBottom();
+          },
+          onRetryNotice: ({ attempt, maxRetries, waitSeconds }) => {
+            showNotice(
+              `AI service busy — retrying automatically (${attempt}/${maxRetries}) in ${waitSeconds}s…`,
+              waitSeconds * 1000 + 800
+            );
+          },
         });
 
-        if (!res.ok) {
-          const errPayload = await res.json().catch(() => ({}));
-          throw new Error(errPayload.error || `Request failed (${res.status})`);
-        }
-
-        if (!res.body) {
-          throw new Error('Streaming response unavailable.');
-        }
-
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let accumulated = '';
-
-        const processEvents = (rawEvents: string[]) => {
-          for (const evt of rawEvents) {
-            const lines = evt.split('\n');
-            for (const line of lines) {
-              if (!line.startsWith('data:')) continue;
-              const jsonStr = line.slice(5).trim();
-              if (!jsonStr) continue;
-
-              const parsed = JSON.parse(jsonStr) as {
-                type: string;
-                text?: string;
-                message?: string;
-              };
-
-              if (parsed.type === 'delta' && parsed.text) {
-                accumulated += parsed.text;
-                const currentText = accumulated;
-                setConversations((prev) =>
-                  prev.map((c) =>
-                    c.id === chatId
-                      ? {
-                          ...c,
-                          updatedAt: Date.now(),
-                          messages: c.messages.map((m) =>
-                            m.id === assistantMsgId ? { ...m, content: currentText } : m
-                          ),
-                        }
-                      : c
-                  )
-                );
-                scrollToBottom();
-              } else if (parsed.type === 'error') {
-                throw new Error(parsed.message || 'Failed to generate a response.');
-              }
-            }
-          }
-        };
-
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) {
-            buffer += decoder.decode();
-            if (buffer.trim()) {
-              processEvents(buffer.replace(/\r\n/g, '\n').split('\n\n'));
-            }
-            break;
-          }
-
-          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-          const events = buffer.split('\n\n');
-          buffer = events.pop() || '';
-          processEvents(events);
-        }
-
-        if (!accumulated.trim()) {
-          throw new Error('Empty response received. Please try regenerating.');
-        }
-
         if (settingsRef.current.autoSpeakResponses) {
-          speakMessageText(assistantMsgId, accumulated);
+          void speakMessageText(assistantMsgId, accumulated);
         }
       } catch (err) {
         const errorObj = err as { name?: string; message?: string };
@@ -784,13 +939,16 @@ export default function App() {
         abortControllerRef.current = null;
       }
     },
-    [model, stopSpeech, scrollToBottom, speakMessageText]
+    [model, showNotice, stopSpeech, scrollToBottom, speakMessageText]
   );
 
   const sendPrompt = useCallback(
     async (promptText: string) => {
       const clean = promptText.trim();
       if (!clean || isStreaming) return;
+      if (settingsRef.current.autoSpeakResponses) {
+        unlockAudioContext();
+      }
 
       const userMsg: ChatMessage = {
         id: createId(),
@@ -913,86 +1071,27 @@ export default function App() {
       }
 
       try {
-        const res = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+        const accumulated = await streamChatCompletion({
+          model,
+          messages: nextHistory,
           signal,
-          body: JSON.stringify({
-            model,
-            messages: nextHistory,
-          }),
+          onDelta: (currentText) => {
+            onStreamDelta(currentText);
+            setConversations((prev) =>
+              prev.map((c) =>
+                c.id === targetChatId
+                  ? {
+                      ...c,
+                      updatedAt: Date.now(),
+                      messages: c.messages.map((m) =>
+                        m.id === assistantMsgId ? { ...m, content: currentText } : m
+                      ),
+                    }
+                  : c
+              )
+            );
+          },
         });
-
-        if (!res.ok) {
-          const errPayload = await res.json().catch(() => ({}));
-          throw new Error(errPayload.error || `Request failed (${res.status})`);
-        }
-        if (!res.body) {
-          throw new Error('Streaming response unavailable.');
-        }
-
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let accumulated = '';
-
-        const processEvents = (rawEvents: string[]) => {
-          for (const evt of rawEvents) {
-            const lines = evt.split('\n');
-            for (const line of lines) {
-              if (!line.startsWith('data:')) continue;
-              const jsonStr = line.slice(5).trim();
-              if (!jsonStr) continue;
-
-              const parsed = JSON.parse(jsonStr) as {
-                type: string;
-                text?: string;
-                message?: string;
-              };
-
-              if (parsed.type === 'delta' && parsed.text) {
-                accumulated += parsed.text;
-                const currentText = accumulated;
-                onStreamDelta(currentText);
-                setConversations((prev) =>
-                  prev.map((c) =>
-                    c.id === targetChatId
-                      ? {
-                          ...c,
-                          updatedAt: Date.now(),
-                          messages: c.messages.map((m) =>
-                            m.id === assistantMsgId ? { ...m, content: currentText } : m
-                          ),
-                        }
-                      : c
-                  )
-                );
-              } else if (parsed.type === 'error') {
-                throw new Error(parsed.message || 'Failed to generate a response.');
-              }
-            }
-          }
-        };
-
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) {
-            buffer += decoder.decode();
-            if (buffer.trim()) {
-              processEvents(buffer.replace(/\r\n/g, '\n').split('\n\n'));
-            }
-            break;
-          }
-
-          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-          const events = buffer.split('\n\n');
-          buffer = events.pop() || '';
-          processEvents(events);
-        }
-
-        if (!accumulated.trim()) {
-          throw new Error('Empty response received. Please try again.');
-        }
 
         return { text: accumulated };
       } catch (err) {
@@ -1259,8 +1358,8 @@ export default function App() {
                 transition={{ duration: 0.35, ease: [0.16, 1, 0.3, 1] }}
                 className="my-auto py-4 sm:py-6 flex flex-col items-center text-center"
               >
-                {/* Central Digital AI Heart */}
-                <div className="relative w-48 h-48 sm:w-64 sm:h-64 md:w-[280px] md:h-[280px] chormo-float">
+                {/* Central Holographic AI Core */}
+                <div className="relative w-56 h-56 sm:w-72 sm:h-72 md:w-[320px] md:h-[320px] lg:w-[350px] lg:h-[350px] chormo-float">
                   <DigitalHeartCore
                     state={aiState}
                     audioLevelRef={audioLevelRef}
@@ -1341,6 +1440,8 @@ export default function App() {
 
       <VoiceMode
         isOpen={voiceModeOpen}
+        settings={settings}
+        onUpdateSettings={setSettings}
         onClose={() => setVoiceModeOpen(false)}
         onSendTurn={handleVoiceTurn}
       />

@@ -8,26 +8,22 @@ export function cleanTextForSpeech(raw: string): string {
     .trim();
 }
 
-const FEMALE_VOICE_PRIORITY = [
-  'google uk english female',
-  'microsoft aria online',
-  'microsoft jenny online',
-  'microsoft ava online',
-  'samantha',
-  'karen',
-  'victoria',
-  'tessa',
-  'moira',
-  'fiona',
-  'allison',
-  'ava',
-  'serena',
-  'kate',
-  'microsoft zira',
-  'microsoft hazel',
-  'microsoft susan',
-  'google us english',
-  'female',
+// Ordered strictly by consistent US English neutral assistant voices first,
+// then deterministic regional fallbacks ONLY if the primary accent family is absent.
+const CONSISTENT_VOICE_PRIORITY: Array<{ hint: string; langPrefix: string }> = [
+  { hint: 'microsoft aria online', langPrefix: 'en-us' },
+  { hint: 'microsoft jenny online', langPrefix: 'en-us' },
+  { hint: 'microsoft ava online', langPrefix: 'en-us' },
+  { hint: 'samantha', langPrefix: 'en-us' },
+  { hint: 'allison', langPrefix: 'en-us' },
+  { hint: 'ava', langPrefix: 'en-us' },
+  { hint: 'microsoft zira', langPrefix: 'en-us' },
+  { hint: 'google us english', langPrefix: 'en-us' },
+  { hint: 'google uk english female', langPrefix: 'en-gb' },
+  { hint: 'microsoft hazel', langPrefix: 'en-gb' },
+  { hint: 'serena', langPrefix: 'en-gb' },
+  { hint: 'kate', langPrefix: 'en-gb' },
+  { hint: 'karen', langPrefix: 'en-au' },
 ];
 
 const MALE_VOICE_HINTS = [
@@ -47,14 +43,71 @@ const MALE_VOICE_HINTS = [
   'male',
 ];
 
+let cachedVoicesPromise: Promise<SpeechSynthesisVoice[]> | null = null;
+
+/**
+ * Waits for browser SpeechSynthesis voices to finish asynchronous initialization
+ * so message #1 never uses a different voice/accent from message #2.
+ */
+export function ensureVoicesLoaded(timeoutMs = 1200): Promise<SpeechSynthesisVoice[]> {
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+    return Promise.resolve([]);
+  }
+
+  const existing = window.speechSynthesis.getVoices();
+  if (existing.length > 0) {
+    return Promise.resolve(existing);
+  }
+
+  if (cachedVoicesPromise) {
+    return cachedVoicesPromise;
+  }
+
+  cachedVoicesPromise = new Promise<SpeechSynthesisVoice[]>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.speechSynthesis.removeEventListener('voiceschanged', onVoicesChanged);
+      window.clearTimeout(timer);
+      const list = window.speechSynthesis.getVoices();
+      if (list.length === 0) {
+        cachedVoicesPromise = null;
+      }
+      resolve(list);
+    };
+
+    const onVoicesChanged = () => {
+      if (window.speechSynthesis.getVoices().length > 0) {
+        finish();
+      }
+    };
+
+    const timer = window.setTimeout(finish, timeoutMs);
+    window.speechSynthesis.addEventListener('voiceschanged', onVoicesChanged);
+  });
+
+  return cachedVoicesPromise;
+}
+
+function normalizeLang(lang?: string): string {
+  return (lang || '').trim().toLowerCase();
+}
+
 export function selectBestFemaleVoice(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null {
   if (!voices || voices.length === 0) return null;
 
-  const englishVoices = voices.filter((v) => v.lang.toLowerCase().startsWith('en'));
-  const pool = englishVoices.length > 0 ? englishVoices : voices;
+  const sorted = [...voices].sort((a, b) => a.voiceURI.localeCompare(b.voiceURI));
+  const enUs = sorted.filter((v) => normalizeLang(v.lang).startsWith('en-us'));
+  const english = sorted.filter((v) => normalizeLang(v.lang).startsWith('en'));
+  const pool = enUs.length > 0 ? enUs : english.length > 0 ? english : sorted;
 
-  for (const hint of FEMALE_VOICE_PRIORITY) {
-    const match = pool.find((v) => v.name.toLowerCase().includes(hint));
+  for (const { hint, langPrefix } of CONSISTENT_VOICE_PRIORITY) {
+    const match = pool.find(
+      (v) =>
+        v.name.toLowerCase().includes(hint) &&
+        normalizeLang(v.lang).startsWith(langPrefix)
+    );
     if (match) return match;
   }
 
@@ -64,6 +117,74 @@ export function selectBestFemaleVoice(voices: SpeechSynthesisVoice[]): SpeechSyn
   });
 
   return nonMale || pool[0] || null;
+}
+
+/**
+ * Resolves the exact persisted voiceURI whenever available.
+ * If the exact URI is unavailable (e.g. different browser), stays locked within the
+ * same language/accent family instead of silently switching accents.
+ */
+export function resolveConsistentVoice(
+  voices: SpeechSynthesisVoice[],
+  lockedVoiceURI?: string,
+  lockedVoiceLang?: string
+): SpeechSynthesisVoice | null {
+  if (!voices || voices.length === 0) return null;
+
+  if (lockedVoiceURI) {
+    const exact = voices.find((v) => v.voiceURI === lockedVoiceURI);
+    if (exact) return exact;
+  }
+
+  const targetLang = normalizeLang(lockedVoiceLang);
+  if (targetLang) {
+    const sameLocale = voices.filter((v) => normalizeLang(v.lang) === targetLang);
+    if (sameLocale.length > 0) {
+      return selectBestFemaleVoice(sameLocale);
+    }
+    const baseLang = targetLang.split('-')[0];
+    if (baseLang) {
+      const sameFamily = voices.filter((v) =>
+        normalizeLang(v.lang).startsWith(baseLang)
+      );
+      if (sameFamily.length > 0) {
+        return selectBestFemaleVoice(sameFamily);
+      }
+    }
+  }
+
+  return selectBestFemaleVoice(voices);
+}
+
+export interface VoiceOptionItem {
+  voiceURI: string;
+  name: string;
+  lang: string;
+}
+
+export function listAvailableVoices(voices: SpeechSynthesisVoice[]): VoiceOptionItem[] {
+  if (!voices || voices.length === 0) return [];
+  const english = voices.filter((v) => normalizeLang(v.lang).startsWith('en'));
+  const pool = english.length > 0 ? english : voices;
+  const seen = new Set<string>();
+  const items: VoiceOptionItem[] = [];
+
+  for (const v of pool) {
+    if (seen.has(v.voiceURI)) continue;
+    seen.add(v.voiceURI);
+    items.push({
+      voiceURI: v.voiceURI,
+      name: v.name,
+      lang: v.lang || 'en-US',
+    });
+  }
+
+  return items.sort((a, b) => {
+    const aUs = a.lang.toLowerCase().startsWith('en-us') ? 0 : 1;
+    const bUs = b.lang.toLowerCase().startsWith('en-us') ? 0 : 1;
+    if (aUs !== bUs) return aUs - bUs;
+    return a.name.localeCompare(b.name);
+  });
 }
 
 let sharedAudioCtx: AudioContext | null = null;
@@ -167,18 +288,18 @@ export function getTranscribeCooldownSeconds(): number {
   return remaining > 0 ? remaining : 0;
 }
 
-function parseRetryAfter(res: Response, bodySeconds?: unknown, fallbackSeconds = 60): number {
+function parseRetryAfter(res: Response, bodySeconds?: unknown): number | undefined {
   if (typeof bodySeconds === 'number' && Number.isFinite(bodySeconds) && bodySeconds > 0) {
-    return Math.min(300, Math.ceil(bodySeconds));
+    return Math.min(20, Math.ceil(bodySeconds));
   }
   const headerVal = res.headers.get('Retry-After');
   if (headerVal) {
     const num = Number(headerVal);
     if (Number.isFinite(num) && num > 0) {
-      return Math.min(300, Math.ceil(num));
+      return Math.min(20, Math.ceil(num));
     }
   }
-  return fallbackSeconds;
+  return undefined;
 }
 
 export async function synthesizeGeminiSpeech(
@@ -204,7 +325,7 @@ export async function synthesizeGeminiSpeech(
       buffer: null,
       rateLimited: true,
       retryAfterSeconds: cooldownSec,
-      error: `Cloud voice usage limit reached — using device voice (~${cooldownSec}s cooldown).`,
+      error: `Studio voice is cooling down (~${cooldownSec}s).`,
     };
   }
 
@@ -227,15 +348,13 @@ export async function synthesizeGeminiSpeech(
     } | null;
 
     if (res.status === 429 || payload?.code === 'RATE_LIMITED') {
-      const retryAfterSeconds = parseRetryAfter(res, payload?.retryAfterSeconds, 60);
-      ttsCooldownUntil = Date.now() + retryAfterSeconds * 1000;
+      const retryAfterSeconds = parseRetryAfter(res, payload?.retryAfterSeconds);
+      ttsCooldownUntil = Date.now() + (retryAfterSeconds ?? 300) * 1000;
       return {
         buffer: null,
         rateLimited: true,
         retryAfterSeconds,
-        error:
-          payload?.error ||
-          `Cloud voice usage limit reached — using device voice for ~${retryAfterSeconds}s.`,
+        error: payload?.error || 'Studio voice quota reached.',
       };
     }
 
@@ -243,12 +362,16 @@ export async function synthesizeGeminiSpeech(
       return {
         buffer: null,
         rateLimited: false,
-        error: payload?.error,
+        error: payload?.error || `Studio voice unavailable (${res.status}).`,
       };
     }
 
     if (!payload?.audioBase64) {
-      return { buffer: null, rateLimited: false };
+      return {
+        buffer: null,
+        rateLimited: false,
+        error: 'Studio voice returned empty audio.',
+      };
     }
 
     const binary = atob(payload.audioBase64);
@@ -268,8 +391,16 @@ export async function synthesizeGeminiSpeech(
       buffer: bytes.buffer,
       mimeType,
     };
-  } catch {
-    return { buffer: null, rateLimited: false };
+  } catch (err) {
+    const e = err as { name?: string };
+    if (e?.name === 'AbortError' && signal?.aborted) {
+      return { buffer: null, rateLimited: false };
+    }
+    return {
+      buffer: null,
+      rateLimited: false,
+      error: 'Unable to reach Studio voice right now.',
+    };
   } finally {
     cleanup();
   }
@@ -339,15 +470,15 @@ export async function transcribeAudioBlob(
     };
 
     if (res.status === 429 || payload.code === 'RATE_LIMITED') {
-      const retryAfterSeconds = parseRetryAfter(res, payload.retryAfterSeconds, 45);
-      transcribeCooldownUntil = Date.now() + retryAfterSeconds * 1000;
+      const retryAfterSeconds = parseRetryAfter(res, payload.retryAfterSeconds);
+      transcribeCooldownUntil = Date.now() + (retryAfterSeconds ?? 60) * 1000;
       return {
         transcript: '',
         rateLimited: true,
         retryAfterSeconds,
         error:
           payload.error ||
-          `Voice usage limit reached. Please wait ~${retryAfterSeconds}s or type your message below.`,
+          'Voice transcription quota reached. Switch to Browser Voice or type your message below.',
       };
     }
 

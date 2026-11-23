@@ -100,21 +100,21 @@ export function BackgroundAmbience({
       aria-hidden="true"
       className="pointer-events-none fixed inset-0 z-0 overflow-hidden select-none"
     >
-      {/* Deep black & midnight navy base gradient */}
+      {/* Deep obsidian & midnight electric-blue base gradient */}
       <div
         className="absolute inset-0"
         style={{
           background:
-            'radial-gradient(ellipse 85% 60% at 50% 28%, rgba(12, 34, 68, 0.55) 0%, rgba(6, 15, 34, 0.85) 48%, #03060f 100%)',
+            'radial-gradient(ellipse 85% 62% at 50% 30%, rgba(16, 48, 96, 0.56) 0%, rgba(5, 14, 34, 0.88) 48%, #02050d 100%)',
         }}
       />
 
-      {/* Ambient cyan and ice-blue top-center illumination */}
+      {/* Ambient electric-blue, cyan and ice-blue central illumination */}
       <div
         className="absolute inset-0"
         style={{
           background:
-            'radial-gradient(circle at 50% 42%, rgba(34, 211, 238, 0.08) 0%, rgba(14, 165, 233, 0.03) 36%, transparent 68%)',
+            'radial-gradient(circle at 50% 42%, rgba(34, 211, 238, 0.1) 0%, rgba(37, 99, 235, 0.06) 36%, transparent 68%)',
         }}
       />
 

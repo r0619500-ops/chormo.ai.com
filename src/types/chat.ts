@@ -17,21 +17,26 @@ export interface Conversation {
 }
 
 export interface ModelOption {
-  id: 'gemini-3.1-flash-lite' | 'gemini-4-hydrogen';
+  id: 'gemini-3.1-flash-lite';
   label: string;
 }
 
 export const MODEL_OPTIONS: ModelOption[] = [
   { id: 'gemini-3.1-flash-lite', label: 'CHORMO Core' },
-  { id: 'gemini-4-hydrogen', label: 'CHORMO Core Pro' },
 ];
+
+export type VoiceEngineMode = 'device-locked' | 'cloud-kore';
 
 export interface AppSettings {
   gridEnabled: boolean;
   particlesEnabled: boolean;
   scanlineEnabled: boolean;
   autoSpeakResponses: boolean;
+  voiceEngine: VoiceEngineMode;
+  voiceURI: string;
+  voiceLang: string;
   speechRate: number;
+  speechPitch: number;
 }
 
 export interface UserProfile {
@@ -45,7 +50,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   particlesEnabled: true,
   scanlineEnabled: true,
   autoSpeakResponses: false,
+  voiceEngine: 'device-locked',
+  voiceURI: '',
+  voiceLang: 'en-US',
   speechRate: 1.0,
+  speechPitch: 1.0,
 };
 
 export const DEFAULT_PROFILE: UserProfile = {

@@ -5,9 +5,13 @@ const MAX_BODY_BYTES = 256 * 1024;
 const MAX_TTS_CHARS = 1800;
 const MAX_CACHE_ITEMS = 24;
 
+const VOICE_NAME = 'Kore';
+const VOICE_STYLE =
+  'Warm, calm, intelligent, friendly conversational female assistant, natural pacing and gentle expressiveness';
+const CACHE_PREFIX = `${VOICE_NAME}:v2:`;
+
 // Small in-memory LRU cache to avoid duplicate Gemini TTS API calls for repeated phrases
 const ttsCache = new Map<string, { audioBase64: string; mimeType: string }>();
-let ttsRateLimitedUntil = 0;
 
 type AugmentedRequest = IncomingMessage & {
   body?: unknown;
@@ -98,15 +102,29 @@ function cleanTextForSpeech(raw: string): string {
     .slice(0, MAX_TTS_CHARS);
 }
 
-function extractRetrySeconds(rawMessage: string): number {
-  const secMatch = /retry(?:\s+in|\s+after)?\s+(\d+(?:\.\d+)?)\s*s/i.exec(rawMessage);
-  if (secMatch) {
-    const parsed = Math.ceil(Number(secMatch[1]));
-    if (Number.isFinite(parsed) && parsed > 0) {
-      return Math.min(300, parsed);
+function extractRetrySeconds(rawMessage: string): { seconds: number; isDaily: boolean } {
+  const hmsMatch = /retry(?:\s+in|\s+after)?\s+(?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)?s/i.exec(rawMessage);
+  if (hmsMatch && (hmsMatch[1] || hmsMatch[2] || hmsMatch[3])) {
+    const total = Math.ceil(
+      Number(hmsMatch[1] || 0) * 3600 +
+        Number(hmsMatch[2] || 0) * 60 +
+        Number(hmsMatch[3] || 0)
+    );
+    if (Number.isFinite(total) && total > 0) {
+      const isDaily = /GenerateRequestsPerDay|RequestsPerDay|per day|limit:\s*0/i.test(rawMessage) || total > 120;
+      return { seconds: total, isDaily };
     }
   }
-  return 60;
+  const delayMatch = /"retryDelay"\s*:\s*"(\d+)s"/i.exec(rawMessage);
+  if (delayMatch) {
+    const total = Number(delayMatch[1]);
+    if (Number.isFinite(total) && total > 0) {
+      const isDaily = /GenerateRequestsPerDay|RequestsPerDay|per day|limit:\s*0/i.test(rawMessage) || total > 120;
+      return { seconds: total, isDaily };
+    }
+  }
+  const isDaily = /GenerateRequestsPerDay|RequestsPerDay|per day|limit:\s*0/i.test(rawMessage);
+  return { seconds: isDaily ? 3600 : 10, isDaily };
 }
 
 function isRateLimitError(status: number | undefined, rawMessage: string): boolean {
@@ -158,21 +176,10 @@ export default async function handler(req: AugmentedRequest, res: ServerResponse
     return;
   }
 
-  const cached = ttsCache.get(spokenText);
+  const cacheKey = `${CACHE_PREFIX}${spokenText}`;
+  const cached = ttsCache.get(cacheKey);
   if (cached) {
     sendJson(res, 200, cached);
-    return;
-  }
-
-  const now = Date.now();
-  if (now < ttsRateLimitedUntil) {
-    const retryAfterSeconds = Math.max(1, Math.ceil((ttsRateLimitedUntil - now) / 1000));
-    res.setHeader('Retry-After', String(retryAfterSeconds));
-    sendJson(res, 429, {
-      code: 'RATE_LIMITED',
-      retryAfterSeconds,
-      error: `Cloud voice quota limit reached. Using device voice for ~${retryAfterSeconds}s.`,
-    });
     return;
   }
 
@@ -186,38 +193,33 @@ export default async function handler(req: AugmentedRequest, res: ServerResponse
       },
     });
 
-    const generateAudio = async (withStyle: boolean) => {
-      const part: { text: string; speechMetadata?: { style: string } } = {
-        text: spokenText,
-      };
-      if (withStyle) {
-        part.speechMetadata = {
-          style:
-            'Warm, calm, intelligent, friendly conversational female assistant, natural pacing and gentle expressiveness',
-        };
-      }
-      return ai.models.generateContent({
+    const generateAudio = async () =>
+      ai.models.generateContent({
         model: 'gemini-3.8-flash-lite-tts',
         contents: [
           {
             role: 'user',
-            parts: [part],
+            parts: [
+              {
+                text: spokenText,
+                speechMetadata: { style: VOICE_STYLE },
+              },
+            ],
           },
         ],
         config: {
           responseModalities: ['AUDIO'],
           speechConfig: {
             voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: 'Kore' },
+              prebuiltVoiceConfig: { voiceName: VOICE_NAME },
             },
           },
         },
       });
-    };
 
     let response;
     try {
-      response = await generateAudio(true);
+      response = await generateAudio();
     } catch (firstErr) {
       const firstObj = firstErr as { status?: number; code?: number; message?: string } | null;
       const firstStatus = firstObj?.status || firstObj?.code;
@@ -233,7 +235,7 @@ export default async function handler(req: AugmentedRequest, res: ServerResponse
         throw firstErr;
       }
       await new Promise((r) => setTimeout(r, 350));
-      response = await generateAudio(false);
+      response = await generateAudio();
     }
 
     const parts = response.candidates?.[0]?.content?.parts || [];
@@ -253,7 +255,7 @@ export default async function handler(req: AugmentedRequest, res: ServerResponse
       const oldestKey = ttsCache.keys().next().value;
       if (oldestKey) ttsCache.delete(oldestKey);
     }
-    ttsCache.set(spokenText, { audioBase64: base64Audio, mimeType });
+    ttsCache.set(cacheKey, { audioBase64: base64Audio, mimeType });
 
     sendJson(res, 200, {
       audioBase64: base64Audio,
@@ -265,14 +267,18 @@ export default async function handler(req: AugmentedRequest, res: ServerResponse
     const rawMsg = String(errObj?.message || '');
 
     if (isRateLimitError(status, rawMsg)) {
-      const retryAfterSeconds = extractRetrySeconds(rawMsg);
-      ttsRateLimitedUntil = Date.now() + retryAfterSeconds * 1000;
-      console.warn(`[CHORMO AI] Gemini TTS rate limited (${retryAfterSeconds}s cooldown)`);
-      res.setHeader('Retry-After', String(retryAfterSeconds));
+      const quota = extractRetrySeconds(rawMsg);
+      const retryAfterSeconds = quota.isDaily ? 0 : Math.min(15, Math.max(2, quota.seconds));
+      console.warn(`[CHORMO AI] Gemini TTS quota/rate limited (${quota.isDaily ? 'daily' : `${retryAfterSeconds}s`})`);
+      if (retryAfterSeconds > 0) {
+        res.setHeader('Retry-After', String(retryAfterSeconds));
+      }
       sendJson(res, 429, {
         code: 'RATE_LIMITED',
-        retryAfterSeconds,
-        error: `Cloud voice quota limit reached. Using device voice for ~${retryAfterSeconds}s.`,
+        ...(retryAfterSeconds > 0 ? { retryAfterSeconds } : {}),
+        error: quota.isDaily
+          ? 'Studio Voice daily quota reached. Switch to Locked System Voice in Settings.'
+          : `Studio Voice rate limit reached (~${retryAfterSeconds}s). Retry shortly or switch to Locked System Voice.`,
       });
       return;
     }

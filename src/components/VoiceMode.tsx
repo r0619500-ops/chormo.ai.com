@@ -16,17 +16,21 @@ import { VoiceOrbCanvas } from './VoiceOrbCanvas';
 import type { VoiceOrbState } from './VoiceOrbCanvas';
 import {
   cleanTextForSpeech,
+  ensureVoicesLoaded,
   getSharedAudioContext,
   getSupportedAudioMimeType,
   getTranscribeCooldownSeconds,
-  selectBestFemaleVoice,
+  resolveConsistentVoice,
   synthesizeGeminiSpeech,
   transcribeAudioBlob,
   unlockAudioContext,
 } from '../utils/voiceSpeech';
+import type { AppSettings } from '../types/chat';
 
 interface VoiceModeProps {
   isOpen: boolean;
+  settings: AppSettings;
+  onUpdateSettings: (next: AppSettings) => void;
   onClose: () => void;
   onSendTurn: (
     userText: string,
@@ -78,7 +82,13 @@ function getSpeechRecognitionCtor(): SpeechRecognitionConstructor | null {
   return w.SpeechRecognition || w.webkitSpeechRecognition || null;
 }
 
-export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
+export function VoiceMode({
+  isOpen,
+  settings,
+  onUpdateSettings,
+  onClose,
+  onSendTurn,
+}: VoiceModeProps) {
   const [orbState, setOrbState] = useState<VoiceOrbState>('idle');
   const [initializingMic, setInitializingMic] = useState(false);
   const [processingLabel, setProcessingLabel] = useState<string | null>(null);
@@ -88,6 +98,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
   const [assistantTranscript, setAssistantTranscript] = useState('');
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [voiceNotice, setVoiceNotice] = useState<string | null>(null);
+  const [voiceErrorEngine, setVoiceErrorEngine] = useState<AppSettings['voiceEngine'] | null>(null);
   const [retryCooldownSec, setRetryCooldownSec] = useState<number>(0);
   const [fallbackInput, setFallbackInput] = useState('');
   const [hasRecordedAudio, setHasRecordedAudio] = useState(false);
@@ -102,6 +113,8 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
   const orbStateRef = useRef<VoiceOrbState>(orbState);
   const captureEngineRef = useRef<CaptureEngine>(captureEngine);
   const onSendTurnRef = useRef(onSendTurn);
+  const settingsRef = useRef<AppSettings>(settings);
+  const onUpdateSettingsRef = useRef(onUpdateSettings);
 
   isOpenRef.current = isOpen;
   micMutedRef.current = micMuted;
@@ -109,6 +122,8 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
   orbStateRef.current = orbState;
   captureEngineRef.current = captureEngine;
   onSendTurnRef.current = onSendTurn;
+  settingsRef.current = settings;
+  onUpdateSettingsRef.current = onUpdateSettings;
 
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const speechWatchdogRef = useRef<number | null>(null);
@@ -126,6 +141,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
   const ttsWatchdogRef = useRef<number | null>(null);
   const ttsPollRef = useRef<number | null>(null);
   const speechTokenRef = useRef<number>(0);
+  const lastFailedSpeechRef = useRef<string | null>(null);
   const finalBufferRef = useRef<string>('');
   const recordedChunksRef = useRef<BlobPart[]>([]);
   const speechDetectedRef = useRef<boolean>(false);
@@ -284,8 +300,14 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
       }
 
       const token = ++speechTokenRef.current;
+      const activeSettings = settingsRef.current;
+      const speechRate = activeSettings.speechRate || 1.0;
+      const speechPitch = activeSettings.speechPitch || 1.0;
+
+      lastFailedSpeechRef.current = null;
+      setVoiceErrorEngine(null);
+      setErrorBanner(null);
       setOrbState('speaking');
-      setProcessingLabel('Preparing voice...');
       stopMicAnalyser();
       stopRecognition();
 
@@ -318,17 +340,56 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
         }
       };
 
-      // 1. Try Gemini Female Voice TTS first (8.5s timeout built in)
-      const ttsController = new AbortController();
-      ttsAbortRef.current = ttsController;
+      const failVoiceOutput = (
+        engine: AppSettings['voiceEngine'],
+        message: string
+      ) => {
+        if (finished || speechTokenRef.current !== token) return;
+        finished = true;
+        clearTtsTimers();
+        if (fallbackSpeechRafRef.current) {
+          window.cancelAnimationFrame(fallbackSpeechRafRef.current);
+          fallbackSpeechRafRef.current = 0;
+        }
+        if (analyserRafRef.current) {
+          window.cancelAnimationFrame(analyserRafRef.current);
+          analyserRafRef.current = 0;
+        }
+        if (activeAudioUrlRef.current) {
+          URL.revokeObjectURL(activeAudioUrlRef.current);
+          activeAudioUrlRef.current = null;
+        }
+        activeSourceRef.current = null;
+        activeHtmlAudioRef.current = null;
+        audioLevelRef.current = 0;
+        setProcessingLabel(null);
+        lastFailedSpeechRef.current = spoken;
+        setVoiceErrorEngine(engine);
+        setErrorBanner(message);
+        setOrbState('idle');
+      };
 
-      const synthResult = await synthesizeGeminiSpeech(spoken, ttsController.signal);
-      if (speechTokenRef.current !== token || !isOpenRef.current) return;
+      // Mode 1: Studio Voice (pinned Kore) — never silently falls back to a different-accent browser voice
+      if (activeSettings.voiceEngine === 'cloud-kore') {
+        setProcessingLabel('Synthesizing Studio voice...');
+        const ttsController = new AbortController();
+        ttsAbortRef.current = ttsController;
 
-      if (synthResult.buffer) {
+        const synthResult = await synthesizeGeminiSpeech(spoken, ttsController.signal);
+        if (speechTokenRef.current !== token || !isOpenRef.current) return;
+
+        if (!synthResult.buffer) {
+          failVoiceOutput(
+            'cloud-kore',
+            synthResult.error ||
+              'Studio Voice (Kore) is unavailable right now. Retry or switch to Locked System Voice.'
+          );
+          return;
+        }
+
         setProcessingLabel(null);
 
-        // Try Web Audio API first if AudioContext can run
+        // Play the exact Kore audio buffer via Web Audio API first
         const ctx = getSharedAudioContext();
         if (ctx) {
           try {
@@ -345,6 +406,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
 
               const source = ctx.createBufferSource();
               source.buffer = decoded;
+              source.playbackRate.value = speechRate;
 
               const analyser = ctx.createAnalyser();
               analyser.fftSize = 256;
@@ -371,7 +433,10 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
                 analyserRafRef.current = window.requestAnimationFrame(sampleSpeech);
               };
 
-              const durationMs = Math.max(1500, Math.ceil(decoded.duration * 1000) + 1200);
+              const durationMs = Math.max(
+                1500,
+                Math.ceil((decoded.duration * 1000) / Math.max(0.5, speechRate)) + 1200
+              );
               ttsWatchdogRef.current = window.setTimeout(finishSpeaking, durationMs);
 
               source.onended = () => {
@@ -383,16 +448,17 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
               return;
             }
           } catch {
-            // Fall through to HTMLAudioElement playback
+            // Fall through to HTMLAudioElement playback using the same Kore buffer
           }
         }
 
-        // Fallback 1b: HTMLAudioElement playback (handles browsers with suspended AudioContext)
+        // Play the same Kore audio buffer via HTMLAudioElement if Web Audio is unavailable
         try {
           const audioBlob = new Blob([synthResult.buffer], { type: synthResult.mimeType });
           const url = URL.createObjectURL(audioBlob);
           activeAudioUrlRef.current = url;
           const audio = new Audio(url);
+          audio.playbackRate = speechRate;
           activeHtmlAudioRef.current = audio;
 
           let t = 0;
@@ -407,80 +473,131 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
           };
 
           audio.onended = finishSpeaking;
-          audio.onerror = finishSpeaking;
+          audio.onerror = () => {
+            failVoiceOutput('cloud-kore', 'Unable to play Studio Voice audio. Tap Retry Voice.');
+          };
 
-          const safetyMs = Math.max(6000, spoken.length * 85 + 2500);
+          const safetyMs = Math.max(
+            6000,
+            Math.ceil((spoken.length * 85) / Math.max(0.5, speechRate)) + 2500
+          );
           ttsWatchdogRef.current = window.setTimeout(finishSpeaking, safetyMs);
 
           await audio.play();
           fallbackSpeechRafRef.current = window.requestAnimationFrame(animateHtmlAudio);
           return;
         } catch {
-          if (activeAudioUrlRef.current) {
-            URL.revokeObjectURL(activeAudioUrlRef.current);
-            activeAudioUrlRef.current = null;
-          }
-          activeHtmlAudioRef.current = null;
+          failVoiceOutput(
+            'cloud-kore',
+            'Audio playback was blocked or unavailable. Tap Retry Voice to hear the reply.'
+          );
+          return;
         }
-      } else if (synthResult.rateLimited) {
-        showVoiceNotice(
-          'Cloud voice usage limit reached — using device voice.',
-          5500
+      }
+
+      // Mode 2: Locked System Voice — awaits voiceschanged so message #1 matches every later message
+      if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+        failVoiceOutput(
+          'device-locked',
+          'Speech synthesis is not supported in this browser.'
+        );
+        return;
+      }
+
+      setProcessingLabel('Loading locked voice...');
+      const loadedVoices = await ensureVoicesLoaded();
+      if (speechTokenRef.current !== token || !isOpenRef.current) return;
+
+      if (loadedVoices.length === 0) {
+        failVoiceOutput(
+          'device-locked',
+          'No system voices are available in this browser right now.'
+        );
+        return;
+      }
+
+      const lockedVoice = resolveConsistentVoice(
+        loadedVoices,
+        activeSettings.voiceURI,
+        activeSettings.voiceLang
+      );
+
+      if (!activeSettings.voiceURI && lockedVoice) {
+        onUpdateSettingsRef.current({
+          ...settingsRef.current,
+          voiceURI: lockedVoice.voiceURI,
+          voiceLang: lockedVoice.lang || 'en-US',
+        });
+      }
+
+      try {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(spoken);
+        if (lockedVoice) {
+          utterance.voice = lockedVoice;
+          utterance.lang = lockedVoice.lang || activeSettings.voiceLang || 'en-US';
+        } else {
+          utterance.lang = activeSettings.voiceLang || 'en-US';
+        }
+        utterance.rate = speechRate;
+        utterance.pitch = speechPitch;
+
+        let t = 0;
+        const animateLockedSpeech = () => {
+          if (speechTokenRef.current !== token) {
+            audioLevelRef.current = 0;
+            return;
+          }
+          t += 0.14;
+          audioLevelRef.current = 0.25 + Math.abs(Math.sin(t) * Math.cos(t * 0.63)) * 0.55;
+          fallbackSpeechRafRef.current = window.requestAnimationFrame(animateLockedSpeech);
+        };
+
+        utterance.onstart = () => {
+          if (speechTokenRef.current === token) {
+            setProcessingLabel(null);
+          }
+        };
+        utterance.onend = finishSpeaking;
+        utterance.onerror = (ev) => {
+          if (finished || speechTokenRef.current !== token) return;
+          const reason = (ev as { error?: string })?.error;
+          if (reason === 'canceled' || reason === 'interrupted') {
+            finishSpeaking();
+            return;
+          }
+          failVoiceOutput(
+            'device-locked',
+            'Unable to play the locked system voice. Tap Retry Voice to try again.'
+          );
+        };
+
+        const maxSpeakMs = Math.max(
+          5000,
+          Math.ceil((spoken.length * 90) / Math.max(0.5, speechRate)) + 3000
+        );
+        ttsWatchdogRef.current = window.setTimeout(finishSpeaking, maxSpeakMs);
+
+        const startedAt = Date.now();
+        ttsPollRef.current = window.setInterval(() => {
+          if (speechTokenRef.current !== token) return;
+          const elapsed = Date.now() - startedAt;
+          if (elapsed > 1400 && !window.speechSynthesis.speaking && !window.speechSynthesis.pending) {
+            finishSpeaking();
+          }
+        }, 400);
+
+        fallbackSpeechRafRef.current = window.requestAnimationFrame(animateLockedSpeech);
+        window.speechSynthesis.speak(utterance);
+        return;
+      } catch {
+        failVoiceOutput(
+          'device-locked',
+          'Speech output failed to start. Tap Retry Voice to try again.'
         );
       }
-
-      // 2. Fallback to browser female-sounding SpeechSynthesis with guaranteed watchdog
-      setProcessingLabel(null);
-      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-        try {
-          window.speechSynthesis.cancel();
-          const utterance = new SpeechSynthesisUtterance(spoken);
-          const voices = window.speechSynthesis.getVoices();
-          const femaleVoice = selectBestFemaleVoice(voices);
-          if (femaleVoice) {
-            utterance.voice = femaleVoice;
-          }
-          utterance.rate = 1.0;
-          utterance.pitch = 1.04;
-
-          let t = 0;
-          const animateFallback = () => {
-            if (speechTokenRef.current !== token) {
-              audioLevelRef.current = 0;
-              return;
-            }
-            t += 0.14;
-            audioLevelRef.current = 0.25 + Math.abs(Math.sin(t) * Math.cos(t * 0.63)) * 0.55;
-            fallbackSpeechRafRef.current = window.requestAnimationFrame(animateFallback);
-          };
-
-          utterance.onend = finishSpeaking;
-          utterance.onerror = finishSpeaking;
-
-          // Safety watchdog so Chromium/Safari missing-onend bug never freezes Voice Mode
-          const maxSpeakMs = Math.max(5000, spoken.length * 90 + 3000);
-          ttsWatchdogRef.current = window.setTimeout(finishSpeaking, maxSpeakMs);
-
-          const startedAt = Date.now();
-          ttsPollRef.current = window.setInterval(() => {
-            if (speechTokenRef.current !== token) return;
-            const elapsed = Date.now() - startedAt;
-            if (elapsed > 1200 && !window.speechSynthesis.speaking && !window.speechSynthesis.pending) {
-              finishSpeaking();
-            }
-          }, 400);
-
-          fallbackSpeechRafRef.current = window.requestAnimationFrame(animateFallback);
-          window.speechSynthesis.speak(utterance);
-          return;
-        } catch {
-          // Fall through to finishSpeaking
-        }
-      }
-
-      finishSpeaking();
     },
-    [clearTtsTimers, showVoiceNotice, stopMicAnalyser, stopRecognition]
+    [clearTtsTimers, stopMicAnalyser, stopRecognition]
   );
 
   const submitSpokenTurn = useCallback(
@@ -686,7 +803,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
         }
 
         if (rateLimited) {
-          const waitSec = retryAfterSeconds || getTranscribeCooldownSeconds() || 45;
+          const waitSec = retryAfterSeconds ?? getTranscribeCooldownSeconds();
           setProcessingLabel(null);
           setUserTranscript('');
           setMicMuted(true);
@@ -694,7 +811,9 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
           setRetryCooldownSec(waitSec);
           setErrorBanner(
             error ||
-              `Voice usage limit reached. Please wait ${waitSec}s, switch to Browser Voice, or type below.`
+              (waitSec > 0
+                ? `Voice transcription rate limit reached. Please wait ${waitSec}s, switch to Browser Voice, or type below.`
+                : 'Voice transcription quota reached. Switch to Browser Voice or type below.')
           );
           setOrbState('idle');
           return;
@@ -933,7 +1052,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
         micMutedRef.current = true;
         setRetryCooldownSec(cooldown);
         setErrorBanner(
-          `Voice usage limit reached. Please wait ${cooldown}s, switch to Browser Voice, or type below.`
+          `Voice transcription rate limit reached. Please wait ${cooldown}s, switch to Browser Voice, or type below.`
         );
         setOrbState('idle');
         return;
@@ -1145,19 +1264,29 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
       return;
     }
 
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      window.speechSynthesis.getVoices();
-    }
+    void ensureVoicesLoaded().then((loaded) => {
+      if (!isOpenRef.current || settingsRef.current.voiceURI || loaded.length === 0) return;
+      const chosen = resolveConsistentVoice(loaded, '', settingsRef.current.voiceLang);
+      if (chosen) {
+        onUpdateSettingsRef.current({
+          ...settingsRef.current,
+          voiceURI: chosen.voiceURI,
+          voiceLang: chosen.lang || 'en-US',
+        });
+      }
+    });
 
     const initialEngine: CaptureEngine = getSpeechRecognitionCtor() ? 'speech-api' : 'gemini-audio';
     captureEngineRef.current = initialEngine;
     setCaptureEngine(initialEngine);
     emptyTranscriptCountRef.current = 0;
     speechAbortCountRef.current = 0;
+    lastFailedSpeechRef.current = null;
     setUserTranscript('');
     setAssistantTranscript('');
     setErrorBanner(null);
     setVoiceNotice(null);
+    setVoiceErrorEngine(null);
     setRetryCooldownSec(getTranscribeCooldownSeconds());
     setProcessingLabel(null);
     setMicMuted(false);
@@ -1380,7 +1509,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
 
       {/* Center Core & Live Conversation Transcript */}
       <div className="relative z-10 flex-1 min-h-0 flex flex-col items-center justify-between px-4 pb-4">
-        <div className="w-full max-w-[420px] flex-1 min-h-[200px] max-h-[340px] flex flex-col items-center justify-center">
+        <div className="w-full max-w-[460px] flex-1 min-h-[220px] max-h-[380px] flex flex-col items-center justify-center">
           <VoiceOrbCanvas
             state={orbState}
             audioLevelRef={audioLevelRef}
@@ -1396,44 +1525,90 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
             <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-red-200 bg-red-500/10 border border-red-400/25 rounded-xl px-3 py-2">
               <span className="flex-1 min-w-[180px]">{errorBanner}</span>
               <div className="flex items-center gap-1.5 shrink-0">
-                {speechApiAvailable && captureEngine === 'gemini-audio' && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      unlockAudioContext();
-                      captureEngineRef.current = 'speech-api';
-                      setCaptureEngine('speech-api');
-                      speechAbortCountRef.current = 0;
-                      setErrorBanner(null);
-                      setMicMuted(false);
-                      micMutedRef.current = false;
-                      startListening();
-                    }}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/35 text-cyan-100 font-medium cursor-pointer"
-                  >
-                    <span>Use Browser Voice</span>
-                  </button>
+                {voiceErrorEngine && lastFailedSpeechRef.current ? (
+                  <>
+                    {voiceErrorEngine === 'cloud-kore' && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          unlockAudioContext();
+                          const nextSettings: AppSettings = {
+                            ...settingsRef.current,
+                            voiceEngine: 'device-locked',
+                          };
+                          settingsRef.current = nextSettings;
+                          onUpdateSettingsRef.current(nextSettings);
+                          const pendingText = lastFailedSpeechRef.current;
+                          setVoiceErrorEngine(null);
+                          setErrorBanner(null);
+                          if (pendingText) {
+                            void speakResponse(pendingText);
+                          }
+                        }}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/35 text-cyan-100 font-medium cursor-pointer whitespace-nowrap"
+                      >
+                        <span>Switch to Locked System Voice</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        unlockAudioContext();
+                        const pendingText = lastFailedSpeechRef.current;
+                        setVoiceErrorEngine(null);
+                        setErrorBanner(null);
+                        if (pendingText) {
+                          void speakResponse(pendingText);
+                        }
+                      }}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/15 text-white font-medium cursor-pointer whitespace-nowrap"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      <span>Retry Voice</span>
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    {speechApiAvailable && captureEngine === 'gemini-audio' && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          unlockAudioContext();
+                          captureEngineRef.current = 'speech-api';
+                          setCaptureEngine('speech-api');
+                          speechAbortCountRef.current = 0;
+                          setErrorBanner(null);
+                          setMicMuted(false);
+                          micMutedRef.current = false;
+                          startListening();
+                        }}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/35 text-cyan-100 font-medium cursor-pointer"
+                      >
+                        <span>Use Browser Voice</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      disabled={retryCooldownSec > 0 && captureEngine === 'gemini-audio'}
+                      onClick={() => {
+                        unlockAudioContext();
+                        emptyTranscriptCountRef.current = 0;
+                        setErrorBanner(null);
+                        setMicMuted(false);
+                        micMutedRef.current = false;
+                        startListening();
+                      }}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/15 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium cursor-pointer"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      <span>
+                        {retryCooldownSec > 0 && captureEngine === 'gemini-audio'
+                          ? `Wait ${retryCooldownSec}s`
+                          : 'Retry'}
+                      </span>
+                    </button>
+                  </>
                 )}
-                <button
-                  type="button"
-                  disabled={retryCooldownSec > 0 && captureEngine === 'gemini-audio'}
-                  onClick={() => {
-                    unlockAudioContext();
-                    emptyTranscriptCountRef.current = 0;
-                    setErrorBanner(null);
-                    setMicMuted(false);
-                    micMutedRef.current = false;
-                    startListening();
-                  }}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/15 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium cursor-pointer"
-                >
-                  <RefreshCw className="w-3 h-3" />
-                  <span>
-                    {retryCooldownSec > 0 && captureEngine === 'gemini-audio'
-                      ? `Wait ${retryCooldownSec}s`
-                      : 'Retry'}
-                  </span>
-                </button>
               </div>
             </div>
           )}
@@ -1502,7 +1677,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
           className={[
             'w-12 h-12 rounded-full border flex items-center justify-center transition-colors cursor-pointer',
             speakerMuted
-              ? 'border-amber-400/40 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25'
+              ? 'border-slate-500/40 bg-slate-800/60 text-slate-300 hover:bg-slate-700/60'
               : 'border-cyan-400/25 bg-[#071124]/80 text-slate-200 hover:bg-cyan-400/15',
           ].join(' ')}
         >

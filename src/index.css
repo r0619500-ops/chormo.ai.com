@@ -123,6 +123,10 @@
   animation: chormo-spin-reverse 18s linear infinite;
 }
 
+.chormo-ring-mid-ccw {
+  animation: chormo-spin-reverse 32s linear infinite;
+}
+
 .chormo-ring-fast-cw {
   animation: chormo-spin-slow 7s linear infinite;
 }
@@ -145,6 +149,7 @@
   .chormo-dot-3,
   .chormo-ring-cw,
   .chormo-ring-ccw,
+  .chormo-ring-mid-ccw,
   .chormo-ring-fast-cw,
   .chormo-ring-fast-ccw,
   .chormo-scan,

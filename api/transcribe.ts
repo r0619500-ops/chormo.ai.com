@@ -109,23 +109,36 @@ function normalizeMimeType(rawMime: unknown): string {
   return 'audio/webm';
 }
 
-function extractRetrySeconds(rawMessage: string): number {
-  const secMatch = /retry(?:\s+in|\s+after)?\s+(\d+(?:\.\d+)?)\s*s/i.exec(rawMessage);
-  if (secMatch) {
-    const parsed = Math.ceil(Number(secMatch[1]));
-    if (Number.isFinite(parsed) && parsed > 0) {
-      return Math.min(300, parsed);
+function extractQuotaSeconds(rawMessage: string): { seconds: number; isDaily: boolean } {
+  const hmsMatch = /retry(?:\s+in|\s+after)?\s+(?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)?s/i.exec(rawMessage);
+  if (hmsMatch && (hmsMatch[1] || hmsMatch[2] || hmsMatch[3])) {
+    const total = Math.ceil(
+      Number(hmsMatch[1] || 0) * 3600 +
+        Number(hmsMatch[2] || 0) * 60 +
+        Number(hmsMatch[3] || 0)
+    );
+    if (Number.isFinite(total) && total > 0) {
+      const isDaily = /GenerateRequestsPerDay|RequestsPerDay|per day|limit:\s*0/i.test(rawMessage) || total > 120;
+      return { seconds: total, isDaily };
     }
   }
-  return 45;
+  const delayMatch = /"retryDelay"\s*:\s*"(\d+)s"/i.exec(rawMessage);
+  if (delayMatch) {
+    const total = Number(delayMatch[1]);
+    if (Number.isFinite(total) && total > 0) {
+      const isDaily = /GenerateRequestsPerDay|RequestsPerDay|per day|limit:\s*0/i.test(rawMessage) || total > 120;
+      return { seconds: total, isDaily };
+    }
+  }
+  const isDaily = /GenerateRequestsPerDay|RequestsPerDay|per day|limit:\s*0/i.test(rawMessage);
+  return { seconds: isDaily ? 3600 : 10, isDaily };
 }
 
 function isRateLimitError(status: number | undefined, rawMessage: string): boolean {
   return status === 429 || /resource_exhausted|quota|rate\s*limit|too many requests/i.test(rawMessage);
 }
 
-let transcribePrimaryCooldownUntil = 0;
-let transcribeAllCooldownUntil = 0;
+const modelCooldownUntil = new Map<string, number>();
 
 export default async function handler(req: AugmentedRequest, res: ServerResponse): Promise<void> {
   if (req.method === 'OPTIONS') {
@@ -173,16 +186,6 @@ export default async function handler(req: AugmentedRequest, res: ServerResponse
   }
 
   const now = Date.now();
-  if (now < transcribeAllCooldownUntil) {
-    const retryAfterSeconds = Math.max(1, Math.ceil((transcribeAllCooldownUntil - now) / 1000));
-    res.setHeader('Retry-After', String(retryAfterSeconds));
-    sendJson(res, 429, {
-      code: 'RATE_LIMITED',
-      retryAfterSeconds,
-      error: `Voice transcription usage limit reached. Please wait ~${retryAfterSeconds}s or type your message below.`,
-    });
-    return;
-  }
 
   const mimeType = normalizeMimeType(body.mimeType);
 
@@ -214,10 +217,11 @@ export default async function handler(req: AugmentedRequest, res: ServerResponse
         },
       });
 
-    const candidateModels =
-      now < transcribePrimaryCooldownUntil
-        ? ['gemini-3.1-flash-lite', 'gemini-4-hydrogen']
-        : ['gemini-3.5-transcribe', 'gemini-3.1-flash-lite', 'gemini-4-hydrogen'];
+    const allCandidateModels = ['gemini-3.5-transcribe', 'gemini-3.1-flash-lite', 'gemini-4-hydrogen'];
+    const activeCandidates = allCandidateModels.filter(
+      (id) => (modelCooldownUntil.get(id) ?? 0) <= now
+    );
+    const candidateModels = activeCandidates.length > 0 ? activeCandidates : ['gemini-3.5-transcribe', 'gemini-3.1-flash-lite'];
 
     let response;
     let lastErr: unknown = null;
@@ -242,13 +246,13 @@ export default async function handler(req: AugmentedRequest, res: ServerResponse
         }
 
         if (isRateLimitError(errStatus, errMsg)) {
-          if (modelId === 'gemini-3.5-transcribe') {
-            transcribePrimaryCooldownUntil = Date.now() + extractRetrySeconds(errMsg) * 1000;
-          }
+          const quota = extractQuotaSeconds(errMsg);
+          const skipMs = quota.isDaily ? 10 * 60 * 1000 : Math.min(30, quota.seconds) * 1000;
+          modelCooldownUntil.set(modelId, Date.now() + skipMs);
           continue;
         }
 
-        // For non-429 model errors (e.g., audio format/404), try next fallback model
+        // For non-429 model errors (e.g., audio format/404/503), try next fallback model
         continue;
       }
     }
@@ -283,14 +287,18 @@ export default async function handler(req: AugmentedRequest, res: ServerResponse
     }
 
     if (isRateLimitError(status, rawMsg)) {
-      const retryAfterSeconds = extractRetrySeconds(rawMsg);
-      transcribeAllCooldownUntil = Date.now() + retryAfterSeconds * 1000;
-      console.warn(`[CHORMO AI] Gemini transcribe rate limited (${retryAfterSeconds}s cooldown)`);
-      res.setHeader('Retry-After', String(retryAfterSeconds));
+      const quota = extractQuotaSeconds(rawMsg);
+      const retryAfterSeconds = quota.isDaily ? 0 : Math.min(20, Math.max(2, quota.seconds));
+      console.warn(`[CHORMO AI] Gemini transcribe provider quota/rate limit (${quota.isDaily ? 'daily' : `${retryAfterSeconds}s`})`);
+      if (retryAfterSeconds > 0) {
+        res.setHeader('Retry-After', String(retryAfterSeconds));
+      }
       sendJson(res, 429, {
         code: 'RATE_LIMITED',
-        retryAfterSeconds,
-        error: `Voice transcription usage limit reached. Please wait ~${retryAfterSeconds}s or type your message below.`,
+        ...(retryAfterSeconds > 0 ? { retryAfterSeconds } : {}),
+        error: quota.isDaily
+          ? 'Gemini voice transcription daily free-tier quota is exhausted. Use Browser Voice or type your message below.'
+          : `Gemini voice rate limit reached. Please wait ~${retryAfterSeconds}s, switch to Browser Voice, or type below.`,
       });
       return;
     }
