@@ -132,17 +132,81 @@ function createTimeoutSignal(
   };
 }
 
-export interface SynthesizedSpeechResult {
-  buffer: ArrayBuffer;
-  mimeType: string;
+export type SynthesizedSpeechResult =
+  | {
+      buffer: ArrayBuffer;
+      mimeType: string;
+      rateLimited?: false;
+    }
+  | {
+      buffer: null;
+      rateLimited: boolean;
+      retryAfterSeconds?: number;
+      error?: string;
+    };
+
+export interface TranscribeResult {
+  transcript: string;
+  error?: string;
+  rateLimited?: boolean;
+  retryAfterSeconds?: number;
+}
+
+const MAX_CLIENT_TTS_CACHE = 12;
+const clientTtsCache = new Map<string, { buffer: ArrayBuffer; mimeType: string }>();
+let ttsCooldownUntil = 0;
+let transcribeCooldownUntil = 0;
+
+export function getTtsCooldownSeconds(): number {
+  const remaining = Math.ceil((ttsCooldownUntil - Date.now()) / 1000);
+  return remaining > 0 ? remaining : 0;
+}
+
+export function getTranscribeCooldownSeconds(): number {
+  const remaining = Math.ceil((transcribeCooldownUntil - Date.now()) / 1000);
+  return remaining > 0 ? remaining : 0;
+}
+
+function parseRetryAfter(res: Response, bodySeconds?: unknown, fallbackSeconds = 60): number {
+  if (typeof bodySeconds === 'number' && Number.isFinite(bodySeconds) && bodySeconds > 0) {
+    return Math.min(300, Math.ceil(bodySeconds));
+  }
+  const headerVal = res.headers.get('Retry-After');
+  if (headerVal) {
+    const num = Number(headerVal);
+    if (Number.isFinite(num) && num > 0) {
+      return Math.min(300, Math.ceil(num));
+    }
+  }
+  return fallbackSeconds;
 }
 
 export async function synthesizeGeminiSpeech(
   text: string,
   signal?: AbortSignal
-): Promise<SynthesizedSpeechResult | null> {
+): Promise<SynthesizedSpeechResult> {
   const cleaned = cleanTextForSpeech(text);
-  if (!cleaned) return null;
+  if (!cleaned) {
+    return { buffer: null, rateLimited: false };
+  }
+
+  const cached = clientTtsCache.get(cleaned);
+  if (cached) {
+    return {
+      buffer: cached.buffer.slice(0),
+      mimeType: cached.mimeType,
+    };
+  }
+
+  const cooldownSec = getTtsCooldownSeconds();
+  if (cooldownSec > 0) {
+    return {
+      buffer: null,
+      rateLimited: true,
+      retryAfterSeconds: cooldownSec,
+      error: `Cloud voice usage limit reached — using device voice (~${cooldownSec}s cooldown).`,
+    };
+  }
 
   const { signal: reqSignal, cleanup } = createTimeoutSignal(8500, signal);
 
@@ -154,26 +218,58 @@ export async function synthesizeGeminiSpeech(
       body: JSON.stringify({ text: cleaned }),
     });
 
-    if (!res.ok) return null;
-
     const payload = (await res.json().catch(() => null)) as {
       audioBase64?: string;
       mimeType?: string;
+      code?: string;
+      retryAfterSeconds?: number;
+      error?: string;
     } | null;
 
-    if (!payload?.audioBase64) return null;
+    if (res.status === 429 || payload?.code === 'RATE_LIMITED') {
+      const retryAfterSeconds = parseRetryAfter(res, payload?.retryAfterSeconds, 60);
+      ttsCooldownUntil = Date.now() + retryAfterSeconds * 1000;
+      return {
+        buffer: null,
+        rateLimited: true,
+        retryAfterSeconds,
+        error:
+          payload?.error ||
+          `Cloud voice usage limit reached — using device voice for ~${retryAfterSeconds}s.`,
+      };
+    }
+
+    if (!res.ok) {
+      return {
+        buffer: null,
+        rateLimited: false,
+        error: payload?.error,
+      };
+    }
+
+    if (!payload?.audioBase64) {
+      return { buffer: null, rateLimited: false };
+    }
 
     const binary = atob(payload.audioBase64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) {
       bytes[i] = binary.charCodeAt(i);
     }
+
+    const mimeType = payload.mimeType || 'audio/wav';
+    if (clientTtsCache.size >= MAX_CLIENT_TTS_CACHE) {
+      const oldestKey = clientTtsCache.keys().next().value;
+      if (oldestKey) clientTtsCache.delete(oldestKey);
+    }
+    clientTtsCache.set(cleaned, { buffer: bytes.buffer.slice(0), mimeType });
+
     return {
       buffer: bytes.buffer,
-      mimeType: payload.mimeType || 'audio/wav',
+      mimeType,
     };
   } catch {
-    return null;
+    return { buffer: null, rateLimited: false };
   } finally {
     cleanup();
   }
@@ -210,7 +306,17 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 export async function transcribeAudioBlob(
   blob: Blob,
   signal?: AbortSignal
-): Promise<{ transcript: string; error?: string }> {
+): Promise<TranscribeResult> {
+  const cooldownSec = getTranscribeCooldownSeconds();
+  if (cooldownSec > 0) {
+    return {
+      transcript: '',
+      rateLimited: true,
+      retryAfterSeconds: cooldownSec,
+      error: `Voice usage limit reached. Please wait ${cooldownSec}s, switch to Browser Voice, or type below.`,
+    };
+  }
+
   const { signal: reqSignal, cleanup, didTimeout } = createTimeoutSignal(18000, signal);
 
   try {
@@ -228,7 +334,22 @@ export async function transcribeAudioBlob(
     const payload = (await res.json().catch(() => ({}))) as {
       transcript?: string;
       error?: string;
+      code?: string;
+      retryAfterSeconds?: number;
     };
+
+    if (res.status === 429 || payload.code === 'RATE_LIMITED') {
+      const retryAfterSeconds = parseRetryAfter(res, payload.retryAfterSeconds, 45);
+      transcribeCooldownUntil = Date.now() + retryAfterSeconds * 1000;
+      return {
+        transcript: '',
+        rateLimited: true,
+        retryAfterSeconds,
+        error:
+          payload.error ||
+          `Voice usage limit reached. Please wait ~${retryAfterSeconds}s or type your message below.`,
+      };
+    }
 
     if (!res.ok) {
       return {

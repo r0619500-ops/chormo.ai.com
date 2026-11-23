@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { ArrowUp, AudioLines, Mic, MicOff, Square } from 'lucide-react';
+import { ArrowUp, AudioLines, ImagePlus, Mic, MicOff, Square } from 'lucide-react';
 
 interface ComposerProps {
   value: string;
@@ -8,6 +8,7 @@ interface ComposerProps {
   onStop: () => void;
   onToggleVoice: () => void;
   onOpenVoiceMode: () => void;
+  onOpenImageCreator: () => void;
   isStreaming: boolean;
   isListening: boolean;
   voiceSupported: boolean;
@@ -21,6 +22,7 @@ export function Composer({
   onStop,
   onToggleVoice,
   onOpenVoiceMode,
+  onOpenImageCreator,
   isStreaming,
   isListening,
   voiceSupported,
@@ -118,6 +120,16 @@ export function Composer({
               ) : (
                 <Mic className="w-[18px] h-[18px] relative z-10" />
               )}
+            </button>
+
+            <button
+              type="button"
+              onClick={onOpenImageCreator}
+              title="Open Image Creator"
+              aria-label="Open Image Creator"
+              className="w-10 h-10 rounded-xl flex items-center justify-center text-slate-400 hover:text-cyan-200 hover:bg-cyan-400/10 border border-transparent hover:border-cyan-400/20 transition-all cursor-pointer"
+            >
+              <ImagePlus className="w-[18px] h-[18px]" />
             </button>
 
             <button

@@ -6,6 +6,7 @@ import { ChatMessageItem } from './components/ChatMessageItem';
 import { ChromoLogo } from './components/ChromoLogo';
 import { Composer } from './components/Composer';
 import { DigitalHeartCore } from './components/DigitalHeartCore';
+import { ImageGenerator } from './components/ImageGenerator';
 import { ProfileModal } from './components/ProfileModal';
 import { SettingsModal } from './components/SettingsModal';
 import { Sidebar } from './components/Sidebar';
@@ -13,6 +14,7 @@ import { VoiceMode } from './components/VoiceMode';
 import {
   cleanTextForSpeech,
   getSupportedAudioMimeType,
+  getTranscribeCooldownSeconds,
   selectBestFemaleVoice,
   transcribeAudioBlob,
   unlockAudioContext,
@@ -172,6 +174,7 @@ export default function App() {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [imageCreatorOpen, setImageCreatorOpen] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
@@ -412,6 +415,12 @@ export default function App() {
 
   const startAudioDictationFallback = useCallback(
     async (baseText: string) => {
+      const cooldown = getTranscribeCooldownSeconds();
+      if (cooldown > 0) {
+        showNotice(`Voice usage limit reached. Please wait ${cooldown}s or type your message.`, 5500);
+        return;
+      }
+
       if (typeof MediaRecorder === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
         showNotice('Voice dictation is not supported in this browser.');
         return;
@@ -422,9 +431,16 @@ export default function App() {
         dictationStreamRef.current = stream;
         startMicLevelMonitor(stream);
         const mimeType = getSupportedAudioMimeType();
-        const recorder = mimeType
-          ? new MediaRecorder(stream, { mimeType })
-          : new MediaRecorder(stream);
+        let recorder: MediaRecorder;
+        try {
+          recorder = mimeType
+            ? new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 24000 })
+            : new MediaRecorder(stream, { audioBitsPerSecond: 24000 });
+        } catch {
+          recorder = mimeType
+            ? new MediaRecorder(stream, { mimeType })
+            : new MediaRecorder(stream);
+        }
         const chunks: BlobPart[] = [];
 
         recorder.ondataavailable = (e) => {
@@ -439,12 +455,12 @@ export default function App() {
           dictationStreamRef.current = null;
 
           const blob = new Blob(chunks, { type: recorder.mimeType || mimeType || 'audio/webm' });
-          if (blob.size < 800) return;
+          if (blob.size < 1200) return;
 
           showNotice('Transcribing speech…', 6000);
-          const { transcript, error } = await transcribeAudioBlob(blob);
+          const { transcript, error, rateLimited } = await transcribeAudioBlob(blob);
           if (error) {
-            showNotice(error);
+            showNotice(error, rateLimited ? 5500 : 4000);
           } else if (transcript) {
             setInput(baseText ? `${baseText} ${transcript}` : transcript);
             showNotice('Transcribed.', 1500);
@@ -1098,6 +1114,7 @@ export default function App() {
         onNewChat={handleNewChat}
         onSelectChat={handleSelectChat}
         onDeleteChat={handleDeleteChat}
+        onOpenImageCreator={() => setImageCreatorOpen(true)}
         onOpenSettings={() => setSettingsOpen(true)}
         onOpenProfile={() => setProfileOpen(true)}
       />
@@ -1273,6 +1290,7 @@ export default function App() {
           onStop={stopStreaming}
           onToggleVoice={handleToggleVoice}
           onOpenVoiceMode={openVoiceMode}
+          onOpenImageCreator={() => setImageCreatorOpen(true)}
           isStreaming={isStreaming}
           isListening={isListening}
           voiceSupported={voiceSupported}
@@ -1284,6 +1302,11 @@ export default function App() {
         isOpen={voiceModeOpen}
         onClose={() => setVoiceModeOpen(false)}
         onSendTurn={handleVoiceTurn}
+      />
+
+      <ImageGenerator
+        isOpen={imageCreatorOpen}
+        onClose={() => setImageCreatorOpen(false)}
       />
 
       <SettingsModal

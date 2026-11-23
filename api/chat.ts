@@ -160,8 +160,8 @@ function mapFriendlyError(err: unknown): { status: number; message: string; retr
   if (status === 429 || /resource_exhausted|quota|rate limit/i.test(raw)) {
     return {
       status: 429,
-      message: 'Rate limit or quota reached. Please wait a moment and try again.',
-      retryable: true,
+      message: 'Usage limit or rate limit reached. Please wait a moment and try again.',
+      retryable: false,
     };
   }
   if (status === 404 || /not_found|no longer available/i.test(raw)) {

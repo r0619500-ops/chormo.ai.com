@@ -18,6 +18,7 @@ import {
   cleanTextForSpeech,
   getSharedAudioContext,
   getSupportedAudioMimeType,
+  getTranscribeCooldownSeconds,
   selectBestFemaleVoice,
   synthesizeGeminiSpeech,
   transcribeAudioBlob,
@@ -86,6 +87,8 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
   const [userTranscript, setUserTranscript] = useState('');
   const [assistantTranscript, setAssistantTranscript] = useState('');
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [voiceNotice, setVoiceNotice] = useState<string | null>(null);
+  const [retryCooldownSec, setRetryCooldownSec] = useState<number>(0);
   const [fallbackInput, setFallbackInput] = useState('');
   const [hasRecordedAudio, setHasRecordedAudio] = useState(false);
   const [captureEngine, setCaptureEngine] = useState<CaptureEngine>(() =>
@@ -127,11 +130,26 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
   const recordedChunksRef = useRef<BlobPart[]>([]);
   const speechDetectedRef = useRef<boolean>(false);
   const discardRecordingRef = useRef<boolean>(false);
+  const manualSendRef = useRef<boolean>(false);
+  const emptyTranscriptCountRef = useRef<number>(0);
+  const speechAbortCountRef = useRef<number>(0);
+  const voiceNoticeTimerRef = useRef<number | null>(null);
 
+  const speechApiAvailable = Boolean(getSpeechRecognitionCtor());
   const recorderSupported =
     typeof window !== 'undefined' &&
     typeof MediaRecorder !== 'undefined' &&
     Boolean(navigator.mediaDevices?.getUserMedia);
+
+  const showVoiceNotice = useCallback((msg: string, duration = 5000) => {
+    setVoiceNotice(msg);
+    if (voiceNoticeTimerRef.current) {
+      window.clearTimeout(voiceNoticeTimerRef.current);
+    }
+    voiceNoticeTimerRef.current = window.setTimeout(() => {
+      setVoiceNotice(null);
+    }, duration);
+  }, []);
 
   const stopMediaRecorderOnly = useCallback((discard: boolean) => {
     discardRecordingRef.current = discard;
@@ -307,7 +325,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
       const synthResult = await synthesizeGeminiSpeech(spoken, ttsController.signal);
       if (speechTokenRef.current !== token || !isOpenRef.current) return;
 
-      if (synthResult) {
+      if (synthResult.buffer) {
         setProcessingLabel(null);
 
         // Try Web Audio API first if AudioContext can run
@@ -404,6 +422,11 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
           }
           activeHtmlAudioRef.current = null;
         }
+      } else if (synthResult.rateLimited) {
+        showVoiceNotice(
+          'Cloud voice usage limit reached — using device voice.',
+          5500
+        );
       }
 
       // 2. Fallback to browser female-sounding SpeechSynthesis with guaranteed watchdog
@@ -457,7 +480,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
 
       finishSpeaking();
     },
-    [clearTtsTimers, stopMicAnalyser, stopRecognition]
+    [clearTtsTimers, showVoiceNotice, stopMicAnalyser, stopRecognition]
   );
 
   const submitSpokenTurn = useCallback(
@@ -576,21 +599,28 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
       let recorder: MediaRecorder;
       try {
         recorder = mimeType
-          ? new MediaRecorder(stream, { mimeType })
-          : new MediaRecorder(stream);
+          ? new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 24000 })
+          : new MediaRecorder(stream, { audioBitsPerSecond: 24000 });
       } catch {
         try {
-          recorder = new MediaRecorder(stream);
+          recorder = mimeType
+            ? new MediaRecorder(stream, { mimeType })
+            : new MediaRecorder(stream);
         } catch {
-          setInitializingMic(false);
-          setErrorBanner('Unable to start microphone recorder in this browser.');
-          setOrbState('idle');
-          return;
+          try {
+            recorder = new MediaRecorder(stream);
+          } catch {
+            setInitializingMic(false);
+            setErrorBanner('Unable to start microphone recorder in this browser.');
+            setOrbState('idle');
+            return;
+          }
         }
       }
 
       const startedAt = performance.now();
       let lastSpeechAt = startedAt;
+      let speechFrames = 0;
       let stoppedByVad = false;
 
       recorder.ondataavailable = (event) => {
@@ -607,6 +637,8 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
         setHasRecordedAudio(false);
 
         const shouldDiscard = discardRecordingRef.current;
+        const wasManualSend = manualSendRef.current;
+        manualSendRef.current = false;
         const chunks = recordedChunksRef.current;
         recordedChunksRef.current = [];
 
@@ -618,8 +650,14 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
           type: recorder.mimeType || mimeType || 'audio/webm',
         });
 
-        if (audioBlob.size < 900) {
-          if (isOpenRef.current && !micMutedRef.current && orbStateRef.current === 'listening') {
+        const minBytes = wasManualSend ? 900 : 2400;
+        if (audioBlob.size < minBytes) {
+          if (
+            isOpenRef.current &&
+            !micMutedRef.current &&
+            orbStateRef.current === 'listening' &&
+            getTranscribeCooldownSeconds() === 0
+          ) {
             startListeningRef.current();
           }
           return;
@@ -634,13 +672,31 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
         const controller = new AbortController();
         transcribeAbortRef.current = controller;
 
-        const { transcript, error } = await transcribeAudioBlob(audioBlob, controller.signal);
+        const { transcript, error, rateLimited, retryAfterSeconds } = await transcribeAudioBlob(
+          audioBlob,
+          controller.signal
+        );
         if (transcribeAbortRef.current === controller) {
           transcribeAbortRef.current = null;
         }
 
         if (!isOpenRef.current || controller.signal.aborted) {
           setProcessingLabel(null);
+          return;
+        }
+
+        if (rateLimited) {
+          const waitSec = retryAfterSeconds || getTranscribeCooldownSeconds() || 45;
+          setProcessingLabel(null);
+          setUserTranscript('');
+          setMicMuted(true);
+          micMutedRef.current = true;
+          setRetryCooldownSec(waitSec);
+          setErrorBanner(
+            error ||
+              `Voice usage limit reached. Please wait ${waitSec}s, switch to Browser Voice, or type below.`
+          );
+          setOrbState('idle');
           return;
         }
 
@@ -653,8 +709,21 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
         }
 
         if (!transcript) {
+          emptyTranscriptCountRef.current += 1;
           setProcessingLabel(null);
           setUserTranscript('');
+
+          if (emptyTranscriptCountRef.current >= 2) {
+            setMicMuted(true);
+            micMutedRef.current = true;
+            setOrbState('idle');
+            showVoiceNotice(
+              "Didn't catch any speech — tap the microphone when you're ready to speak.",
+              6000
+            );
+            return;
+          }
+
           if (!micMutedRef.current) {
             startListeningRef.current();
           } else {
@@ -663,6 +732,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
           return;
         }
 
+        emptyTranscriptCountRef.current = 0;
         await submitSpokenTurn(transcript);
       };
 
@@ -679,7 +749,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
       setInitializingMic(false);
       setOrbState('listening');
 
-      // Monitor RMS energy for Voice Activity Detection (auto-send on natural pause)
+      // Monitor RMS energy for sustained Voice Activity Detection (avoids burning API quota on noise)
       if (!analyser) {
         return;
       }
@@ -706,9 +776,14 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
         audioLevelRef.current = Math.min(1, rms * 4.5);
 
         const now = performance.now();
-        if (rms > 0.024) {
-          speechDetectedRef.current = true;
-          lastSpeechAt = now;
+        if (rms > 0.032) {
+          speechFrames += 1;
+          if (speechFrames >= 3) {
+            speechDetectedRef.current = true;
+            lastSpeechAt = now;
+          }
+        } else {
+          speechFrames = Math.max(0, speechFrames - 1);
         }
 
         const silenceMs = now - lastSpeechAt;
@@ -716,7 +791,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
 
         if (
           !stoppedByVad &&
-          ((speechDetectedRef.current && silenceMs >= 1150) || totalMs >= 20000)
+          ((speechDetectedRef.current && totalMs >= 650 && silenceMs >= 1150) || totalMs >= 20000)
         ) {
           stoppedByVad = true;
           if (!speechDetectedRef.current) {
@@ -725,6 +800,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
             startGeminiAudioRecorder(stream, analyser);
             return;
           }
+          manualSendRef.current = false;
           stopMediaRecorderOnly(false);
           return;
         }
@@ -734,7 +810,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
 
       analyserRafRef.current = window.requestAnimationFrame(monitorVad);
     },
-    [stopMediaRecorderOnly, stopMicAnalyser, submitSpokenTurn]
+    [showVoiceNotice, stopMediaRecorderOnly, stopMicAnalyser, submitSpokenTurn]
   );
 
   const startMicPipeline = useCallback(async () => {
@@ -850,6 +926,19 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
     const shouldUseSpeechApi = captureEngineRef.current === 'speech-api' && Boolean(SpeechRec);
 
     if (!shouldUseSpeechApi) {
+      const cooldown = getTranscribeCooldownSeconds();
+      if (cooldown > 0) {
+        setInitializingMic(false);
+        setMicMuted(true);
+        micMutedRef.current = true;
+        setRetryCooldownSec(cooldown);
+        setErrorBanner(
+          `Voice usage limit reached. Please wait ${cooldown}s, switch to Browser Voice, or type below.`
+        );
+        setOrbState('idle');
+        return;
+      }
+
       captureEngineRef.current = 'gemini-audio';
       setCaptureEngine('gemini-audio');
       void startMicPipeline();
@@ -874,12 +963,26 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
         captureEngineRef.current = 'gemini-audio';
         setCaptureEngine('gemini-audio');
         stopRecognition();
-        void startMicPipeline();
+        const cooldown = getTranscribeCooldownSeconds();
+        if (cooldown > 0) {
+          setInitializingMic(false);
+          setMicMuted(true);
+          micMutedRef.current = true;
+          setRetryCooldownSec(cooldown);
+          setErrorBanner(
+            `Browser speech was unavailable and cloud transcription limit is cooling down (${cooldown}s). Type below or try again shortly.`
+          );
+          setOrbState('idle');
+        } else {
+          void startMicPipeline();
+        }
       }
     }, 1800);
 
     recognition.onstart = () => {
       started = true;
+      speechAbortCountRef.current = 0;
+      emptyTranscriptCountRef.current = 0;
       if (speechWatchdogRef.current) {
         window.clearTimeout(speechWatchdogRef.current);
         speechWatchdogRef.current = null;
@@ -940,18 +1043,35 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
         micMutedRef.current = true;
         setOrbState('idle');
         stopRecognition();
+      } else if (event.error === 'aborted') {
+        speechAbortCountRef.current += 1;
+        if (speechAbortCountRef.current >= 2) {
+          captureEngineRef.current = 'gemini-audio';
+          setCaptureEngine('gemini-audio');
+          stopRecognition();
+          if (isOpenRef.current && !micMutedRef.current) {
+            if (getTranscribeCooldownSeconds() > 0) {
+              startListeningRef.current();
+            } else {
+              void startMicPipeline();
+            }
+          }
+        }
       } else if (
         event.error === 'network' ||
         event.error === 'language-not-supported' ||
-        event.error === 'audio-capture' ||
-        event.error === 'aborted'
+        event.error === 'audio-capture'
       ) {
-        // Seamlessly fall back to Gemini Audio transcription (/api/transcribe)
+        // Fall back to Gemini Audio transcription (/api/transcribe) if not in cooldown
         captureEngineRef.current = 'gemini-audio';
         setCaptureEngine('gemini-audio');
         stopRecognition();
         if (isOpenRef.current && !micMutedRef.current) {
-          void startMicPipeline();
+          if (getTranscribeCooldownSeconds() > 0) {
+            startListeningRef.current();
+          } else {
+            void startMicPipeline();
+          }
         }
       } else if (event.error !== 'no-speech') {
         setErrorBanner(`Voice recognition error: ${event.error}`);
@@ -1032,9 +1152,13 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
     const initialEngine: CaptureEngine = getSpeechRecognitionCtor() ? 'speech-api' : 'gemini-audio';
     captureEngineRef.current = initialEngine;
     setCaptureEngine(initialEngine);
+    emptyTranscriptCountRef.current = 0;
+    speechAbortCountRef.current = 0;
     setUserTranscript('');
     setAssistantTranscript('');
     setErrorBanner(null);
+    setVoiceNotice(null);
+    setRetryCooldownSec(getTranscribeCooldownSeconds());
     setProcessingLabel(null);
     setMicMuted(false);
     micMutedRef.current = false;
@@ -1047,11 +1171,23 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
 
     return () => {
       window.clearTimeout(timer);
+      if (voiceNoticeTimerRef.current) {
+        window.clearTimeout(voiceNoticeTimerRef.current);
+        voiceNoticeTimerRef.current = null;
+      }
       stopAllRef.current();
       stopRecRef.current();
       stopMicRef.current();
     };
   }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen || retryCooldownSec <= 0) return;
+    const timer = window.setTimeout(() => {
+      setRetryCooldownSec((prev) => Math.max(0, prev - 1));
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [isOpen, retryCooldownSec]);
 
   const handleInterruptAndListen = useCallback(() => {
     unlockAudioContext();
@@ -1106,6 +1242,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
       captureEngineRef.current === 'gemini-audio' &&
       mediaRecorderRef.current
     ) {
+      manualSendRef.current = true;
       stopMediaRecorderOnly(false);
       return;
     }
@@ -1134,6 +1271,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
       mediaRecorderRef.current &&
       (speechDetectedRef.current || recordedChunksRef.current.length > 2)
     ) {
+      manualSendRef.current = true;
       stopMediaRecorderOnly(false);
       return;
     }
@@ -1256,25 +1394,57 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
         <div className="w-full max-w-xl rounded-2xl border border-cyan-400/20 bg-[#071124]/75 backdrop-blur-xl px-5 py-4 space-y-2.5 max-h-[180px] overflow-y-auto shadow-[0_8px_32px_rgba(0,0,0,0.4)]">
           {errorBanner && (
             <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-red-200 bg-red-500/10 border border-red-400/25 rounded-xl px-3 py-2">
-              <span>{errorBanner}</span>
-              <button
-                type="button"
-                onClick={() => {
-                  unlockAudioContext();
-                  setErrorBanner(null);
-                  setMicMuted(false);
-                  micMutedRef.current = false;
-                  startListening();
-                }}
-                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/15 text-white font-medium cursor-pointer"
-              >
-                <RefreshCw className="w-3 h-3" />
-                <span>Retry</span>
-              </button>
+              <span className="flex-1 min-w-[180px]">{errorBanner}</span>
+              <div className="flex items-center gap-1.5 shrink-0">
+                {speechApiAvailable && captureEngine === 'gemini-audio' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      unlockAudioContext();
+                      captureEngineRef.current = 'speech-api';
+                      setCaptureEngine('speech-api');
+                      speechAbortCountRef.current = 0;
+                      setErrorBanner(null);
+                      setMicMuted(false);
+                      micMutedRef.current = false;
+                      startListening();
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/35 text-cyan-100 font-medium cursor-pointer"
+                  >
+                    <span>Use Browser Voice</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  disabled={retryCooldownSec > 0 && captureEngine === 'gemini-audio'}
+                  onClick={() => {
+                    unlockAudioContext();
+                    emptyTranscriptCountRef.current = 0;
+                    setErrorBanner(null);
+                    setMicMuted(false);
+                    micMutedRef.current = false;
+                    startListening();
+                  }}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/15 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium cursor-pointer"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  <span>
+                    {retryCooldownSec > 0 && captureEngine === 'gemini-audio'
+                      ? `Wait ${retryCooldownSec}s`
+                      : 'Retry'}
+                  </span>
+                </button>
+              </div>
             </div>
           )}
 
-          {!userTranscript && !assistantTranscript && !errorBanner && (
+          {voiceNotice && !errorBanner && (
+            <div className="text-xs text-cyan-200/90 bg-cyan-500/10 border border-cyan-400/20 rounded-xl px-3 py-2 text-center">
+              {voiceNotice}
+            </div>
+          )}
+
+          {!userTranscript && !assistantTranscript && !errorBanner && !voiceNotice && (
             <p className="text-sm text-slate-400 text-center">
               {initializingMic
                 ? 'Initializing voice core...'
@@ -1297,8 +1467,8 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
           )}
         </div>
 
-        {/* Fallback text input when microphone/recorder is unavailable or errored */}
-        {(!recorderSupported || errorBanner) && (
+        {/* Fallback text input when microphone/recorder is unavailable, errored, or cooling down */}
+        {(!recorderSupported || errorBanner || retryCooldownSec > 0) && (
           <form
             onSubmit={handleFallbackSubmit}
             className="mt-3 w-full max-w-xl flex items-center gap-2 px-3 py-1.5 rounded-xl border border-cyan-400/20 bg-[#071124]/80"

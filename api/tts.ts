@@ -2,7 +2,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { GoogleGenAI } from '@google/genai';
 
 const MAX_BODY_BYTES = 256 * 1024;
-const MAX_TTS_CHARS = 2400;
+const MAX_TTS_CHARS = 1800;
+const MAX_CACHE_ITEMS = 24;
+
+// Small in-memory LRU cache to avoid duplicate Gemini TTS API calls for repeated phrases
+const ttsCache = new Map<string, { audioBase64: string; mimeType: string }>();
+let ttsRateLimitedUntil = 0;
 
 type AugmentedRequest = IncomingMessage & {
   body?: unknown;
@@ -93,6 +98,21 @@ function cleanTextForSpeech(raw: string): string {
     .slice(0, MAX_TTS_CHARS);
 }
 
+function extractRetrySeconds(rawMessage: string): number {
+  const secMatch = /retry(?:\s+in|\s+after)?\s+(\d+(?:\.\d+)?)\s*s/i.exec(rawMessage);
+  if (secMatch) {
+    const parsed = Math.ceil(Number(secMatch[1]));
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.min(300, parsed);
+    }
+  }
+  return 60;
+}
+
+function isRateLimitError(status: number | undefined, rawMessage: string): boolean {
+  return status === 429 || /resource_exhausted|quota|rate\s*limit|too many requests/i.test(rawMessage);
+}
+
 export default async function handler(req: AugmentedRequest, res: ServerResponse): Promise<void> {
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
@@ -108,7 +128,10 @@ export default async function handler(req: AugmentedRequest, res: ServerResponse
 
   const apiKey = getApiKey();
   if (!apiKey) {
-    sendJson(res, 503, { error: 'Speech service is unavailable.' });
+    sendJson(res, 503, {
+      code: 'NOT_CONFIGURED',
+      error: 'Speech service is not configured. Please set GEMINI_API_KEY in your environment variables.',
+    });
     return;
   }
 
@@ -132,6 +155,24 @@ export default async function handler(req: AugmentedRequest, res: ServerResponse
   const spokenText = cleanTextForSpeech(body.text);
   if (!spokenText) {
     sendJson(res, 400, { error: 'No speakable text provided.' });
+    return;
+  }
+
+  const cached = ttsCache.get(spokenText);
+  if (cached) {
+    sendJson(res, 200, cached);
+    return;
+  }
+
+  const now = Date.now();
+  if (now < ttsRateLimitedUntil) {
+    const retryAfterSeconds = Math.max(1, Math.ceil((ttsRateLimitedUntil - now) / 1000));
+    res.setHeader('Retry-After', String(retryAfterSeconds));
+    sendJson(res, 429, {
+      code: 'RATE_LIMITED',
+      retryAfterSeconds,
+      error: `Cloud voice quota limit reached. Using device voice for ~${retryAfterSeconds}s.`,
+    });
     return;
   }
 
@@ -178,8 +219,17 @@ export default async function handler(req: AugmentedRequest, res: ServerResponse
     try {
       response = await generateAudio(true);
     } catch (firstErr) {
-      const firstStatus = (firstErr as { status?: number; code?: number } | null)?.status;
-      if (firstStatus === 401 || firstStatus === 403) {
+      const firstObj = firstErr as { status?: number; code?: number; message?: string } | null;
+      const firstStatus = firstObj?.status || firstObj?.code;
+      const firstMsg = String(firstObj?.message || '');
+      // Never retry on quota/rate-limit (429) or auth/bad-request errors
+      if (
+        firstStatus === 400 ||
+        firstStatus === 401 ||
+        firstStatus === 403 ||
+        firstStatus === 404 ||
+        isRateLimitError(firstStatus, firstMsg)
+      ) {
         throw firstErr;
       }
       await new Promise((r) => setTimeout(r, 350));
@@ -192,9 +242,18 @@ export default async function handler(req: AugmentedRequest, res: ServerResponse
     const mimeType = inlinePart?.inlineData?.mimeType || 'audio/wav';
 
     if (!base64Audio) {
-      sendJson(res, 502, { error: 'Speech synthesis returned no audio data.' });
+      sendJson(res, 502, {
+        code: 'EMPTY_AUDIO',
+        error: 'Speech synthesis returned no audio data.',
+      });
       return;
     }
+
+    if (ttsCache.size >= MAX_CACHE_ITEMS) {
+      const oldestKey = ttsCache.keys().next().value;
+      if (oldestKey) ttsCache.delete(oldestKey);
+    }
+    ttsCache.set(spokenText, { audioBase64: base64Audio, mimeType });
 
     sendJson(res, 200, {
       audioBase64: base64Audio,
@@ -203,15 +262,38 @@ export default async function handler(req: AugmentedRequest, res: ServerResponse
   } catch (err) {
     const errObj = err as { status?: number; code?: number; message?: string } | null;
     const status = errObj?.status || errObj?.code;
-    console.error('[CHORMO AI] Gemini TTS error:', status, errObj?.message || 'unknown');
-    if (status === 429) {
-      sendJson(res, 429, { error: 'Speech synthesis rate limit reached.' });
+    const rawMsg = String(errObj?.message || '');
+
+    if (isRateLimitError(status, rawMsg)) {
+      const retryAfterSeconds = extractRetrySeconds(rawMsg);
+      ttsRateLimitedUntil = Date.now() + retryAfterSeconds * 1000;
+      console.warn(`[CHORMO AI] Gemini TTS rate limited (${retryAfterSeconds}s cooldown)`);
+      res.setHeader('Retry-After', String(retryAfterSeconds));
+      sendJson(res, 429, {
+        code: 'RATE_LIMITED',
+        retryAfterSeconds,
+        error: `Cloud voice quota limit reached. Using device voice for ~${retryAfterSeconds}s.`,
+      });
       return;
     }
-    if (status === 401 || status === 403) {
-      sendJson(res, 401, { error: 'Speech synthesis authentication failed.' });
+
+    if (
+      status === 401 ||
+      status === 403 ||
+      /api_key_invalid|permission_denied|api key/i.test(rawMsg)
+    ) {
+      console.error('[CHORMO AI] Gemini TTS auth error:', status || rawMsg);
+      sendJson(res, 401, {
+        code: 'AUTH_ERROR',
+        error: 'Speech synthesis authentication failed. Verify GEMINI_API_KEY in environment settings.',
+      });
       return;
     }
-    sendJson(res, 502, { error: 'Speech synthesis unavailable.' });
+
+    console.warn('[CHORMO AI] Gemini TTS warning:', status || rawMsg || 'unknown');
+    sendJson(res, 502, {
+      code: 'UPSTREAM_ERROR',
+      error: 'Cloud speech synthesis unavailable.',
+    });
   }
 }

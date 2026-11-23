@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import {
+  ImagePlus,
   MessageSquare,
   PanelLeftClose,
   Plus,
@@ -23,6 +24,7 @@ interface SidebarProps {
   onNewChat: () => void;
   onSelectChat: (id: string) => void;
   onDeleteChat: (id: string) => void;
+  onOpenImageCreator: () => void;
   onOpenSettings: () => void;
   onOpenProfile: () => void;
 }
@@ -49,6 +51,7 @@ export function Sidebar({
   onNewChat,
   onSelectChat,
   onDeleteChat,
+  onOpenImageCreator,
   onOpenSettings,
   onOpenProfile,
 }: SidebarProps) {
@@ -242,8 +245,20 @@ export function Sidebar({
           )}
         </nav>
 
-        {/* Bottom System Navigation: Settings & User Profile */}
+        {/* Bottom System Navigation: Image Creator, Settings & User Profile */}
         <div className="p-3 border-t border-cyan-400/12 space-y-1.5 shrink-0 bg-[#040917]/60">
+          <button
+            type="button"
+            onClick={() => {
+              onOpenImageCreator();
+              onCloseMobile();
+            }}
+            className="w-full min-h-[40px] px-3 py-2 rounded-xl text-[13.5px] text-slate-300 hover:text-sky-50 hover:bg-cyan-400/10 border border-transparent hover:border-cyan-400/20 flex items-center gap-2.5 transition-colors cursor-pointer whitespace-nowrap"
+          >
+            <ImagePlus className="w-4 h-4 text-cyan-400 shrink-0" />
+            <span>Image Creator</span>
+          </button>
+
           <button
             type="button"
             onClick={() => {
